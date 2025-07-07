@@ -1,0 +1,19 @@
+{
+  "name": "twilio-voip-ai-agent",
+  "version": "1.0.0",
+  "description": "Node.js WebSocket server for Twilio AI voice agent integration",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.13.0",
+    "axios": "^1.4.0",
+    "openai": "^4.6.0"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "author": "",
+  "license": "MIT"
+}

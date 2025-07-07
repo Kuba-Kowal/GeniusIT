@@ -1,35 +1,35 @@
+require('dotenv').config();
+const express = require('express');
+const http = require('http');
 const WebSocket = require('ws');
-const { transcribeAudio, askGPT, synthesizeSpeech } = require('./services');
-const { decodeMulaw } = require('./utils');
 
-const wss = new WebSocket.Server({ port: process.env.PORT || 8080 });
+const app = express();
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ noServer: true });
 
-wss.on('connection', ws => {
-  console.log('🔌 New Twilio connection');
+const PORT = process.env.PORT || 3000;
 
-  let audioBuffer = [];
+wss.on('connection', (ws) => {
+  console.log('WebSocket connection established');
 
   ws.on('message', async (message) => {
-    const data = JSON.parse(message);
-    if (data.event === 'media') {
-      const decoded = decodeMulaw(Buffer.from(data.media.payload, 'base64'));
-      audioBuffer.push(decoded);
-    }
-
-    if (data.event === 'stop') {
-      console.log('⛔ Call ended. Transcribing...');
-      const fullAudio = Buffer.concat(audioBuffer);
-      const text = await transcribeAudio(fullAudio);
-      console.log('🗣 Transcribed:', text);
-
-      const reply = await askGPT(text);
-      console.log('🤖 GPT Reply:', reply);
-
-      const audioResponse = await synthesizeSpeech(reply);
-      // NOTE: Twilio can't stream audio back via WebSocket directly yet
-      // You could play audio via TwiML redirect or serve it via <Play>
-    }
+    console.log('Received message:', message);
+    // TODO: Parse Twilio stream JSON and integrate with OpenAI & Google TTS here
+    // Example: echo back received message
+    ws.send(message);
   });
 
-  ws.on('close', () => console.log('❌ Connection closed'));
+  ws.on('close', () => {
+    console.log('WebSocket connection closed');
+  });
+});
+
+server.on('upgrade', (request, socket, head) => {
+  wss.handleUpgrade(request, socket, head, (ws) => {
+    wss.emit('connection', ws, request);
+  });
+});
+
+server.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`);
 });

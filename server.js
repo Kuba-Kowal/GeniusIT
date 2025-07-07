@@ -45,7 +45,7 @@ wss.on('connection', (ws) => {
 
       try {
         const completion = await openai.chat.completions.create({
-          model: 'gpt-4',
+          model: 'gpt-4o-mini',
           messages: [{ role: 'user', content: transcript }]
         });
 

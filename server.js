@@ -73,3 +73,16 @@ wss.on('connection', (ws) => {
     console.log('❌ WebSocket connection closed');
   });
 });
+
+const { twiml: { VoiceResponse } } = require('twilio');
+
+app.post('/twiml', (req, res) => {
+  const response = new VoiceResponse();
+
+  response.connect().stream({
+    url: `wss://${process.env.https://twillio-1.onrender.com}/`, // Make sure this matches your Render WebSocket endpoint
+  });
+
+  res.type('text/xml');
+  res.send(response.toString());
+});

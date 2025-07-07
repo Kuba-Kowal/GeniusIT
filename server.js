@@ -1,35 +1,75 @@
 require('dotenv').config();
 const express = require('express');
-const http = require('http');
-const WebSocket = require('ws');
-
+const { WebSocketServer } = require('ws');
+const { TextToSpeechClient } = require('@google-cloud/text-to-speech');
+const { OpenAI } = require('openai');
+const fs = require('fs');
+const path = require('path');
 const app = express();
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ noServer: true });
 
-const PORT = process.env.PORT || 10000;
+// 🔧 Setup OpenAI
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
+});
+
+// 🔧 Setup Google TTS
+const ttsClient = new TextToSpeechClient({
+  projectId: process.env.GOOGLE_PROJECT_ID,
+  credentials: {
+    client_email: process.env.GOOGLE_CLIENT_EMAIL,
+    private_key: process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n')
+  }
+});
+
+// 🌐 HTTP server
+const server = app.listen(process.env.PORT || 3000, () =>
+  console.log(`Server running on port ${process.env.PORT || 3000}`)
+);
+
+// 🔊 WebSocket server
+const wss = new WebSocketServer({ server });
 
 wss.on('connection', (ws) => {
-  console.log('WebSocket connection established');
+  console.log('🔌 WebSocket connection established');
 
-  ws.on('message', async (message) => {
-    console.log('Received message:', message);
-    // TODO: Parse Twilio stream JSON and integrate with OpenAI & Google TTS here
-    // Example: echo back received message
-    ws.send(message);
+  let transcript = "";
+
+  ws.on('message', async (data) => {
+    const message = data.toString();
+
+    // Assume text is plain; in a real case you'd decode audio and transcribe here
+    transcript += message;
+
+    if (transcript.length > 100 || message.endsWith('.') || message.endsWith('?')) {
+      console.log('🧠 Sending to OpenAI:', transcript);
+
+      try {
+        const completion = await openai.chat.completions.create({
+          model: 'gpt-4',
+          messages: [{ role: 'user', content: transcript }]
+        });
+
+        const aiResponse = completion.choices[0].message.content;
+        console.log('🤖 OpenAI response:', aiResponse);
+
+        // 🗣️ Convert to audio using Google TTS
+        const [response] = await ttsClient.synthesizeSpeech({
+          input: { text: aiResponse },
+          voice: { languageCode: 'en-US', ssmlGender: 'NEUTRAL' },
+          audioConfig: { audioEncoding: 'LINEAR16' }
+        });
+
+        // Send audio buffer directly to Twilio stream
+        ws.send(response.audioContent);
+
+        transcript = ""; // reset after response
+      } catch (err) {
+        console.error('🔥 Error during AI/TTS:', err);
+      }
+    }
   });
 
   ws.on('close', () => {
-    console.log('WebSocket connection closed');
+    console.log('❌ WebSocket connection closed');
   });
-});
-
-server.on('upgrade', (request, socket, head) => {
-  wss.handleUpgrade(request, socket, head, (ws) => {
-    wss.emit('connection', ws, request);
-  });
-});
-
-server.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
 });

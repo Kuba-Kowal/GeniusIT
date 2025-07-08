@@ -31,15 +31,12 @@ wss.on('connection', (ws) => {
 
   const processAudio = async () => {
     if (ws.readyState !== ws.OPEN) return;
-
     clearTimeout(silenceTimer);
     silenceTimer = null;
-
     if (audioBuffer.length < 4000) {
       audioBuffer = Buffer.alloc(0);
       return;
     }
-    console.log('Silence detected, processing audio...');
     const text = await recognizeSpeech(audioBuffer);
     audioBuffer = Buffer.alloc(0);
     if (text) {
@@ -53,8 +50,8 @@ wss.on('connection', (ws) => {
     switch (data.event) {
       case 'start':
         streamSid = data.start.streamSid;
-        console.log(`Twilio media stream started: ${streamSid}`);
-        await handleAIResponse(ws, "welcome_message", streamSid, "Hello! How can I help you today?");
+        console.log(`Twilio media stream started: ${streamSid}. Waiting for user to speak.`);
+        // No welcome message here anymore. We wait for the user.
         break;
       case 'media':
         clearTimeout(silenceTimer);
@@ -69,33 +66,22 @@ wss.on('connection', (ws) => {
         break;
     }
   });
-
-  ws.on('close', () => console.log('WebSocket disconnected.'));
-  ws.on('error', (err) => console.error('WebSocket error:', err));
 });
 
-// --- Core AI and TTS Functions ---
-async function handleAIResponse(ws, text, streamSid, overrideText = null) {
+async function handleAIResponse(ws, text, streamSid) {
   if (ws.readyState !== ws.OPEN) return;
-  let aiReply;
   try {
-    if (overrideText) {
-      aiReply = overrideText;
-    } else {
-      const completion = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
-        messages: [{ role: 'system', content: 'You are a helpful voice assistant. Keep answers concise.' }, { role: 'user', content: text }],
-      });
-      aiReply = completion.choices[0].message.content;
-    }
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'system', content: 'You are a helpful voice assistant. Keep answers concise.' }, { role: 'user', content: text }],
+    });
+    const aiReply = completion.choices[0].message.content;
     console.log('🤖 AI reply:', aiReply);
     const audioResponse = await createGoogleTTSAudio(aiReply);
     if (audioResponse) {
-      streamAudioToTwilio(ws, audioResponse, streamSid); // No 'await' here
+      streamAudioToTwilio(ws, audioResponse, streamSid);
     }
-  } catch (e) {
-    console.error('Error in handleAIResponse:', e);
-  }
+  } catch (e) { console.error('Error in handleAIResponse:', e); }
 }
 
 async function createGoogleTTSAudio(text) {
@@ -112,34 +98,24 @@ async function createGoogleTTSAudio(text) {
   }
 }
 
-/**
- * Streams audio back to Twilio without blocking the event loop.
- */
 function streamAudioToTwilio(ws, audioBuffer, streamSid) {
-  console.log('Streaming audio back to Twilio...');
   const chunkSize = 320;
   let i = 0;
-
   function sendChunk() {
-    if (i >= audioBuffer.length || ws.readyState !== ws.OPEN) {
-      console.log('Finished streaming audio.');
-      return;
-    }
+    if (i >= audioBuffer.length || ws.readyState !== ws.OPEN) return;
     const chunk = audioBuffer.slice(i, i + chunkSize);
     ws.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }));
     i += chunkSize;
-    setTimeout(sendChunk, 20); // Schedule the next chunk
+    setTimeout(sendChunk, 20);
   }
   sendChunk();
 }
 
 async function recognizeSpeech(pcmBuffer) {
   try {
-    console.log('Transcribing audio with Whisper...');
     const transcription = await openai.audio.transcriptions.create({
-        file: { value: pcmBuffer, name: "audio.raw" },
-        model: "whisper-1",
-      });
+        file: { value: pcmBuffer, name: "audio.raw" }, model: "whisper-1",
+    });
     return transcription.text;
   } catch (e) {
     console.error('Whisper Error:', e);
@@ -147,6 +123,5 @@ async function recognizeSpeech(pcmBuffer) {
   }
 }
 
-// --- Start Server ---
 const port = process.env.PORT || 3000;
 server.listen(port, () => console.log(`Server listening on port ${port}`));

@@ -7,8 +7,8 @@ import path from 'path';
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const WP_AI_RESPONSE_URL = 'https://your-wp-site.com/wp-json/twilio/v1/ai-response';
 
-const wss = new WebSocketServer({ port: 8080 });
-console.log('WebSocket server listening on ws://localhost:8080');
+const wss = new WebSocketServer({ port: 3000 });
+console.log('WebSocket server listening on ws://localhost:3000');
 
 wss.on('connection', (ws) => {
   console.log('Client connected');

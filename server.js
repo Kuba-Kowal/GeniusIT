@@ -8,8 +8,13 @@ import { TextToSpeechClient } from '@google-cloud/text-to-speech';
 
 // --- Server Setup for Render Health Checks ---
 const server = createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('Health check passed.');
+  if (req.method === 'GET' && req.url === '/') {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Health check passed.');
+  } else {
+    res.writeHead(404);
+    res.end();
+  }
 });
 
 const wss = new WebSocketServer({ noServer: true });
@@ -27,17 +32,16 @@ wss.on('connection', (ws) => {
   let streamSid;
   let audioBuffer = Buffer.alloc(0);
   let silenceTimer = null;
-  const silenceThreshold = 1000; // 1 second of silence
+  const silenceThreshold = 1200; // 1.2 seconds of silence
 
   const processAudio = async () => {
-    if (audioBuffer.length < 4000) {
-      console.log('Audio buffer too short, ignoring.');
+    if (audioBuffer.length < 4000) { // Ignore very short audio clips
       audioBuffer = Buffer.alloc(0);
       return;
     }
-    console.log('Silence detected, processing audio...');
+    console.log('Silence detected, processing audio buffer...');
     const text = await recognizeSpeech(audioBuffer);
-    audioBuffer = Buffer.alloc(0); // Clear buffer
+    audioBuffer = Buffer.alloc(0); // Clear buffer for next turn
     if (text) {
       console.log('🗣️ You said:', text);
       await handleAIResponse(ws, text, streamSid);
@@ -50,7 +54,7 @@ wss.on('connection', (ws) => {
       case 'start':
         streamSid = data.start.streamSid;
         console.log(`Twilio media stream started: ${streamSid}`);
-        // Send a welcome message immediately upon connection
+        // Send a welcome message
         await handleAIResponse(ws, "welcome_message", streamSid, "Hello! How can I help you today?");
         break;
       case 'media':
@@ -61,6 +65,7 @@ wss.on('connection', (ws) => {
         break;
       case 'stop':
         console.log('Twilio media stream stopped.');
+        clearTimeout(silenceTimer);
         ws.close();
         break;
     }
@@ -109,24 +114,36 @@ async function createGoogleTTSAudio(text) {
 }
 
 async function streamAudioToTwilio(ws, audioBuffer, streamSid) {
-  console.log('Streaming audio back to Twilio...');
-  const chunkSize = 320; // 20ms chunks
-  for (let i = 0; i < audioBuffer.length; i += chunkSize) {
-    if (ws.readyState === ws.OPEN) {
-      ws.send(JSON.stringify({ event: 'media', streamSid, media: { payload: Buffer.from(chunk).toString('base64') } }));
-      await new Promise(resolve => setTimeout(resolve, 20));
-    } else {
-      break;
+    if (!audioBuffer) return;
+    console.log('Streaming audio back to Twilio...');
+    const chunkSize = 320; // 20ms chunks of 8kHz 16bit mono audio
+    for (let i = 0; i < audioBuffer.length; i += chunkSize) {
+        // Make sure the WebSocket is still open before sending
+        if (ws.readyState === ws.OPEN) {
+            ws.send(JSON.stringify({
+                event: 'media',
+                streamSid,
+                media: { payload: audioBuffer.slice(i, i + chunkSize).toString('base64') }
+            }));
+            // Wait 20ms to simulate real-time streaming
+            await new Promise(resolve => setTimeout(resolve, 20));
+        } else {
+            break;
+        }
     }
-  }
-  console.log('Finished streaming audio.');
+    console.log('Finished streaming audio.');
 }
 
 async function recognizeSpeech(pcmBuffer) {
   try {
     console.log('Transcribing audio with Whisper...');
-    const file = { value: pcmBuffer, name: 'audio.raw', type: 'audio/l16; rate=8000' };
-    const transcription = await openai.audio.transcriptions.create({ file: file, model: 'whisper-1' });
+    // The OpenAI library expects a File-like object. We create one in memory here.
+    const audioFile = new File([pcmBuffer], "audio.raw");
+
+    const transcription = await openai.audio.transcriptions.create({
+      file: audioFile,
+      model: 'whisper-1',
+    });
     return transcription.text;
   } catch (e) {
     console.error('Whisper Error:', e);
@@ -136,4 +153,4 @@ async function recognizeSpeech(pcmBuffer) {
 
 // --- Start Server ---
 const port = process.env.PORT || 3000;
-server.listen(port, () => console.log(`Server listening on port ${port}`));
+server.listen(port, () => console.log(`Server listening on port ${port

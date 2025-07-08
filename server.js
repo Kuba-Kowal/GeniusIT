@@ -4,85 +4,75 @@ const { WebSocketServer } = require('ws');
 const { TextToSpeechClient } = require('@google-cloud/text-to-speech');
 const { OpenAI } = require('openai');
 const fs = require('fs');
-const path = require('path');
+const { Readable } = require('stream');
 const app = express();
 
-// 🔧 Setup OpenAI
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
-});
+// OpenAI + Whisper
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// 🔧 Setup Google TTS
+// Google TTS
 const ttsClient = new TextToSpeechClient({
-  projectId: process.env.GOOGLE_PROJECT_ID,
   credentials: {
     client_email: process.env.GOOGLE_CLIENT_EMAIL,
-    private_key: process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n')
-  }
+    private_key: process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+  },
 });
 
-// 🌐 HTTP server
+// HTTP server
 const server = app.listen(process.env.PORT || 3000, () =>
   console.log(`Server running on port ${process.env.PORT || 3000}`)
 );
 
-// 🔊 WebSocket server
+// WebSocket for Twilio
 const wss = new WebSocketServer({ server });
 
 wss.on('connection', (ws) => {
-  console.log('🔌 WebSocket connection established');
-
-  let transcript = "";
+  console.log('✅ WebSocket connected');
+  let audioBuffer = [];
 
   ws.on('message', async (data) => {
-    const message = data.toString();
+    audioBuffer.push(data);
 
-    // Assume text is plain; in a real case you'd decode audio and transcribe here
-    transcript += message;
-
-    if (transcript.length > 100 || message.endsWith('.') || message.endsWith('?')) {
-      console.log('🧠 Sending to OpenAI:', transcript);
+    if (audioBuffer.length >= 10) {
+      const fullAudio = Buffer.concat(audioBuffer);
+      const tempFile = './temp.wav';
+      fs.writeFileSync(tempFile, fullAudio);
 
       try {
-        const completion = await openai.chat.completions.create({
-          model: 'gpt-4o-mini',
-          messages: [{ role: 'user', content: transcript }]
+        const transcript = await openai.audio.transcriptions.create({
+          file: fs.createReadStream(tempFile),
+          model: 'whisper-1'
         });
 
-        const aiResponse = completion.choices[0].message.content;
-        console.log('🤖 OpenAI response:', aiResponse);
+        const gptResponse = await openai.chat.completions.create({
+          model: 'gpt-4',
+          messages: [{ role: 'user', content: transcript.text }]
+        });
 
-        // 🗣️ Convert to audio using Google TTS
+        const aiReply = gptResponse.choices[0].message.content;
+
         const [response] = await ttsClient.synthesizeSpeech({
-          input: { text: aiResponse },
+          input: { text: aiReply },
           voice: { languageCode: 'en-US', ssmlGender: 'NEUTRAL' },
           audioConfig: { audioEncoding: 'LINEAR16' }
         });
 
-        // Send audio buffer directly to Twilio stream
         ws.send(response.audioContent);
-
-        transcript = ""; // reset after response
+        audioBuffer = [];
       } catch (err) {
-        console.error('🔥 Error during AI/TTS:', err);
+        console.error('❌ AI/TTS error:', err);
       }
     }
   });
 
-  ws.on('close', () => {
-    console.log('❌ WebSocket connection closed');
-  });
+  ws.on('close', () => console.log('🔌 WebSocket closed'));
 });
 
 const { twiml: { VoiceResponse } } = require('twilio');
 
 app.post('/twiml', (req, res) => {
   const response = new VoiceResponse();
-
-  response.connect().stream({
-    url: `wss://${process.env.WEBSOCKET_HOST}/`, // Make sure this matches your Render WebSocket endpoint
-  });
-
+  response.connect().stream({ url: `wss://${process.env.WEBSOCKET_HOST}` });
   res.type('text/xml');
   res.send(response.toString());
 });

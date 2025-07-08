@@ -35,13 +35,13 @@ wss.on('connection', (ws) => {
   const silenceThreshold = 1200; // 1.2 seconds of silence
 
   const processAudio = async () => {
-    if (audioBuffer.length < 4000) { // Ignore very short audio clips
+    if (audioBuffer.length < 4000) {
       audioBuffer = Buffer.alloc(0);
       return;
     }
-    console.log('Silence detected, processing audio buffer...');
+    console.log('Silence detected, processing audio...');
     const text = await recognizeSpeech(audioBuffer);
-    audioBuffer = Buffer.alloc(0); // Clear buffer for next turn
+    audioBuffer = Buffer.alloc(0);
     if (text) {
       console.log('🗣️ You said:', text);
       await handleAIResponse(ws, text, streamSid);
@@ -54,7 +54,6 @@ wss.on('connection', (ws) => {
       case 'start':
         streamSid = data.start.streamSid;
         console.log(`Twilio media stream started: ${streamSid}`);
-        // Send a welcome message
         await handleAIResponse(ws, "welcome_message", streamSid, "Hello! How can I help you today?");
         break;
       case 'media':
@@ -65,7 +64,6 @@ wss.on('connection', (ws) => {
         break;
       case 'stop':
         console.log('Twilio media stream stopped.');
-        clearTimeout(silenceTimer);
         ws.close();
         break;
     }
@@ -114,26 +112,21 @@ async function createGoogleTTSAudio(text) {
 }
 
 async function streamAudioToTwilio(ws, audioBuffer, streamSid) {
-    if (!audioBuffer) return;
-    console.log('Streaming audio back to Twilio...');
-    const chunkSize = 320; // 20ms chunks of 8kHz 16bit mono audio
-    for (let i = 0; i < audioBuffer.length; i += chunkSize) {
-        // Make sure the WebSocket is still open before sending
-        if (ws.readyState === ws.OPEN) {
-            ws.send(JSON.stringify({
-                event: 'media',
-                streamSid,
-                media: { payload: audioBuffer.slice(i, i + chunkSize).toString('base64') }
-            }));
-            // Wait 20ms to simulate real-time streaming
-            await new Promise(resolve => setTimeout(resolve, 20));
-        } else {
-            break;
-        }
+  console.log('Streaming audio back to Twilio...');
+  const chunkSize = 320;
+  for (let i = 0; i < audioBuffer.length; i += chunkSize) {
+    if (ws.readyState === ws.OPEN) {
+      ws.send(JSON.stringify({ event: 'media', streamSid, media: { payload: Buffer.from(chunk).toString('base64') } }));
+      await new Promise(resolve => setTimeout(resolve, 20));
     }
-    console.log('Finished streaming audio.');
+  }
+  console.log('Finished streaming audio.');
 }
 
+/**
+ * Transcribes audio using OpenAI Whisper.
+ * This version correctly formats the buffer for the API.
+ */
 async function recognizeSpeech(pcmBuffer) {
   try {
     console.log('Transcribing audio with Whisper...');
@@ -153,4 +146,4 @@ async function recognizeSpeech(pcmBuffer) {
 
 // --- Start Server ---
 const port = process.env.PORT || 3000;
-server.listen(port, () => console.log(`Server listening on port ${port
+server.listen(port, () => console.log(`Server listening on port ${port}`));

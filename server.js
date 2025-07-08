@@ -8,13 +8,8 @@ import { TextToSpeechClient } from '@google-cloud/text-to-speech';
 
 // --- Server Setup for Render Health Checks ---
 const server = createServer((req, res) => {
-  if (req.method === 'GET' && req.url === '/') {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Health check passed.');
-  } else {
-    res.writeHead(404);
-    res.end();
-  }
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Health check passed.');
 });
 
 const wss = new WebSocketServer({ noServer: true });
@@ -35,13 +30,17 @@ wss.on('connection', (ws) => {
   const silenceThreshold = 1200; // 1.2 seconds of silence
 
   const processAudio = async () => {
+    // Stop the timer so it doesn't fire again
+    clearTimeout(silenceTimer);
+    silenceTimer = null;
+
     if (audioBuffer.length < 4000) {
-      audioBuffer = Buffer.alloc(0);
+      audioBuffer = Buffer.alloc(0); // Buffer too short, ignore.
       return;
     }
     console.log('Silence detected, processing audio...');
     const text = await recognizeSpeech(audioBuffer);
-    audioBuffer = Buffer.alloc(0);
+    audioBuffer = Buffer.alloc(0); // Clear buffer for next turn
     if (text) {
       console.log('🗣️ You said:', text);
       await handleAIResponse(ws, text, streamSid);
@@ -63,7 +62,11 @@ wss.on('connection', (ws) => {
         silenceTimer = setTimeout(processAudio, silenceThreshold);
         break;
       case 'stop':
-        console.log('Twilio media stream stopped.');
+        console.log(`Twilio media stream stopped: ${streamSid}`);
+        // When the stream stops, clear any pending silence timers.
+        if (silenceTimer) {
+          clearTimeout(silenceTimer);
+        }
         ws.close();
         break;
     }
@@ -117,7 +120,6 @@ async function streamAudioToTwilio(ws, audioBuffer, streamSid) {
   for (let i = 0; i < audioBuffer.length; i += chunkSize) {
     if (ws.readyState === ws.OPEN) {
       const chunk = audioBuffer.slice(i, i + chunkSize);
-      // CORRECTED THIS LINE: The payload needs to be the chunk itself.
       ws.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }));
       await new Promise(resolve => setTimeout(resolve, 20));
     } else {
@@ -127,10 +129,14 @@ async function streamAudioToTwilio(ws, audioBuffer, streamSid) {
   console.log('Finished streaming audio.');
 }
 
+/**
+ * Transcribes audio using OpenAI Whisper.
+ * This version correctly formats the buffer for the Node.js SDK.
+ */
 async function recognizeSpeech(pcmBuffer) {
   try {
     console.log('Transcribing audio with Whisper...');
-    // CORRECTED THIS PART: The OpenAI library can handle a buffer directly if we give it a dummy file name.
+    // The Node.js SDK expects a file-like object with a value (the buffer) and a name.
     const transcription = await openai.audio.transcriptions.create({
         file: {
           value: pcmBuffer,

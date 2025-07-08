@@ -7,7 +7,18 @@ import OpenAI from 'openai';
 import { TextToSpeechClient } from '@google-cloud/text-to-speech';
 
 // --- Create a standard HTTP server ---
-const server = createServer();
+// This creates the HTTP server and adds a request listener to handle health checks.
+const server = createServer((req, res) => {
+  if (req.method === 'GET' && req.url === '/') {
+    // Respond with a 200 OK status for the health check
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Health check passed.');
+  } else {
+    // For any other non-websocket request, respond with a 404
+    res.writeHead(404);
+    res.end();
+  }
+});
 
 // --- Initialize Clients ---
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });

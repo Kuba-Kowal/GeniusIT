@@ -4,7 +4,7 @@ import { OpenAI } from 'openai';
 import { Transform } from 'stream';
 
 // === CONFIG: fill in your keys here ===
-const OPENAI_API_KEY = 'YOUR_OPENAI_API_KEY';
+const OPENAI_API_KEY = process.env['OPENAI_API_KEY'];
 
 // Twilio audio is 8kHz 16-bit mono signed PCM (little endian)
 const AUDIO_SAMPLE_RATE = 8000;

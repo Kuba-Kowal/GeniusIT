@@ -1,21 +1,17 @@
 {
-  "name": "twilio-voip-ai-agent",
+  "name": "twilio-ai-voicebot",
   "version": "1.0.0",
-  "description": "Node.js WebSocket server for Twilio AI voice agent integration",
+  "description": "AI Voice Chatbot",
   "main": "server.js",
   "type": "module",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "@google-cloud/text-to-speech": "^6.1.0",
-    "axios": "^1.4.0",
-    "dotenv": "^17.0.1",
-    "express": "^5.1.0",
-    "http": "^0.0.1-security",
-    "openai": "^4.104.0",
-    "twilio": "^5.7.2",
-    "ws": "^8.18.3"
+    "@google-cloud/text-to-speech": "^5.0.1",
+    "dotenv": "^16.3.1",
+    "openai": "^4.20.1",
+    "ws": "^8.14.2"
   },
   "engines": {
     "node": ">=16"

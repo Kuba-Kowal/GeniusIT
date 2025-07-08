@@ -8,6 +8,8 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
+const PORT = process.env.PORT || 3000;
+
 const AUDIO_SAMPLE_RATE = 8000;
 const AUDIO_CHANNELS = 1;
 const AUDIO_BIT_DEPTH = 16;
@@ -42,6 +44,11 @@ async function recognizeSpeech(pcmBuffer) {
   try {
     const wavBuffer = pcmToWav(pcmBuffer);
 
+    // Whisper expects a file-like object, simulate using Blob-like or Buffer with filename
+    // openai client needs a Readable or Blob; but node sdk might allow Buffer directly
+    // If your SDK does not accept Buffer directly, write to temp file and pass path.
+
+    // Let's try direct passing - might depend on your openai version
     const transcription = await openai.audio.transcriptions.create({
       file: wavBuffer,
       model: 'whisper-1',
@@ -70,91 +77,62 @@ async function getChatResponse(prompt) {
   }
 }
 
-// Simple dummy TTS generator that converts text to speech WAV using Google TTS or OpenAI TTS can be done here.
-// For demo, we will just send a silence WAV of 1 second to avoid blocking Twilio call.
-// Replace this with your own TTS solution or use Twilio <Say> for voice.
-// Here we generate 1 second of silence PCM:
-
-function generateSilence(durationMs = 1000) {
-  const samples = (AUDIO_SAMPLE_RATE * durationMs) / 1000;
-  return Buffer.alloc(samples * 2, 0); // 16-bit samples, silence
-}
-
-async function speakText(ws, text) {
-  console.log('🤖 AI reply:', text);
-
-  // For demo, send 1 second silence WAV audio to Twilio stream to keep media alive.
-  // TODO: Integrate real TTS here (Google Cloud TTS, Amazon Polly, or OpenAI if available).
-
-  // Silence PCM
-  const silencePCM = generateSilence(1000);
-  const silenceWAV = pcmToWav(silencePCM);
-
-  // Split into chunks (Twilio expects ~20ms audio per media frame)
-  const chunkSize = AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * 2 * 0.02; // 20ms chunk (16-bit * 2 bytes)
-  for (let offset = 0; offset < silenceWAV.length; offset += chunkSize) {
-    const chunk = silenceWAV.slice(offset, offset + chunkSize);
-    ws.send(
-      JSON.stringify({
-        event: 'media',
-        media: {
-          payload: chunk.toString('base64'),
-        },
-      }),
-    );
-    await new Promise((r) => setTimeout(r, 20)); // ~20ms delay
-  }
-}
-
-const wss = new WebSocket.Server({ port: 3000 });
+const wss = new WebSocket.Server({ port: PORT });
 
 wss.on('connection', (ws) => {
-  console.log('WebSocket connected');
+  console.log('🔌 WebSocket connected');
 
   let audioBuffer = Buffer.alloc(0);
   let lastTranscript = '';
 
   ws.on('message', async (msg) => {
-    // Twilio sends JSON messages with event types
     try {
       const data = JSON.parse(msg.toString());
+      // Log every event to see traffic
+      console.log('⬅️ Event:', data.event);
+
       if (data.event === 'media') {
-        // base64 encoded audio chunk
         const audioData = Buffer.from(data.media.payload, 'base64');
         audioBuffer = Buffer.concat([audioBuffer, audioData]);
 
-        // Wait until we get ~3 seconds of audio to send to Whisper
+        // Process every ~3 seconds of audio
         if (audioBuffer.length >= AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * 2 * 3) {
           const pcmChunk = audioBuffer;
-          audioBuffer = Buffer.alloc(0); // reset buffer
+          audioBuffer = Buffer.alloc(0);
 
           const transcript = await recognizeSpeech(pcmChunk);
+
           if (transcript && transcript !== lastTranscript) {
             lastTranscript = transcript;
             console.log('🗣️ You said:', transcript);
 
             const aiReply = await getChatResponse(transcript);
-            await speakText(ws, aiReply);
+            console.log('🤖 AI says:', aiReply);
+
+            // For now, cannot stream audio back via media stream easily,
+            // so we just log reply and keep call alive by doing nothing here.
+
+            // Could signal client or Twilio to <Say> or <Play> the reply by call control API (advanced).
           }
         }
       } else if (data.event === 'start') {
-        console.log('Twilio stream started');
+        console.log('▶️ Twilio stream started');
       } else if (data.event === 'stop') {
-        console.log('Twilio stream stopped');
+        console.log('⏹️ Twilio stream stopped');
         ws.close();
       }
     } catch (e) {
-      console.error('Error processing WS message:', e);
+      console.error('❌ WS message error:', e);
     }
   });
 
   ws.on('close', () => {
-    console.log('WebSocket disconnected');
+    console.log('❌ WebSocket disconnected');
   });
 
   ws.on('error', (e) => {
-    console.error('WebSocket error:', e);
+    console.error('❌ WebSocket error:', e);
   });
 });
 
-console.log('WebSocket server listening on port 3000');
+console.log(`🌐 WebSocket server listening on ws://0.0.0.0:${PORT}`);

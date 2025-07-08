@@ -30,10 +30,8 @@ wss.on('connection', (ws) => {
   const silenceThreshold = 1200; // 1.2 seconds of silence
 
   const processAudio = async () => {
-    // CRITICAL FIX: Ensure connection is still open before processing.
-    if (ws.readyState !== ws.OPEN) {
-        return;
-    }
+    if (ws.readyState !== ws.OPEN) return;
+
     clearTimeout(silenceTimer);
     silenceTimer = null;
 
@@ -78,9 +76,7 @@ wss.on('connection', (ws) => {
 
 // --- Core AI and TTS Functions ---
 async function handleAIResponse(ws, text, streamSid, overrideText = null) {
-  // CRITICAL FIX: Ensure connection is still open before handling.
   if (ws.readyState !== ws.OPEN) return;
-
   let aiReply;
   try {
     if (overrideText) {
@@ -93,10 +89,9 @@ async function handleAIResponse(ws, text, streamSid, overrideText = null) {
       aiReply = completion.choices[0].message.content;
     }
     console.log('🤖 AI reply:', aiReply);
-
     const audioResponse = await createGoogleTTSAudio(aiReply);
     if (audioResponse) {
-      await streamAudioToTwilio(ws, audioResponse, streamSid);
+      streamAudioToTwilio(ws, audioResponse, streamSid); // No 'await' here
     }
   } catch (e) {
     console.error('Error in handleAIResponse:', e);
@@ -117,31 +112,32 @@ async function createGoogleTTSAudio(text) {
   }
 }
 
-async function streamAudioToTwilio(ws, audioBuffer, streamSid) {
+/**
+ * Streams audio back to Twilio without blocking the event loop.
+ */
+function streamAudioToTwilio(ws, audioBuffer, streamSid) {
   console.log('Streaming audio back to Twilio...');
   const chunkSize = 320;
-  for (let i = 0; i < audioBuffer.length; i += chunkSize) {
-    // CRITICAL FIX: Ensure connection is still open before sending.
-    if (ws.readyState === ws.OPEN) {
-      const chunk = audioBuffer.slice(i, i + chunkSize);
-      ws.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }));
-      await new Promise(resolve => setTimeout(resolve, 20));
-    } else {
-      console.log('WebSocket closed during streaming, stopping.');
-      break;
+  let i = 0;
+
+  function sendChunk() {
+    if (i >= audioBuffer.length || ws.readyState !== ws.OPEN) {
+      console.log('Finished streaming audio.');
+      return;
     }
+    const chunk = audioBuffer.slice(i, i + chunkSize);
+    ws.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }));
+    i += chunkSize;
+    setTimeout(sendChunk, 20); // Schedule the next chunk
   }
-  console.log('Finished streaming audio.');
+  sendChunk();
 }
 
 async function recognizeSpeech(pcmBuffer) {
   try {
     console.log('Transcribing audio with Whisper...');
     const transcription = await openai.audio.transcriptions.create({
-        file: {
-          value: pcmBuffer,
-          name: "audio.raw",
-        },
+        file: { value: pcmBuffer, name: "audio.raw" },
         model: "whisper-1",
       });
     return transcription.text;

@@ -1,17 +1,30 @@
 import { config } from 'dotenv';
 config();
 
+import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
 import OpenAI from 'openai';
 import { TextToSpeechClient } from '@google-cloud/text-to-speech';
 
+// --- Create a standard HTTP server ---
+const server = createServer();
+
+// --- Initialize Clients ---
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const ttsClient = new TextToSpeechClient();
 
-const wss = new WebSocketServer({ port: process.env.PORT || 3000 });
+// --- Create a WebSocket server and attach it to the HTTP server ---
+const wss = new WebSocketServer({ noServer: true });
+
+server.on('upgrade', (request, socket, head) => {
+    console.log('Received upgrade request, attempting to handle WebSocket handshake...');
+    wss.handleUpgrade(request, socket, head, (ws) => {
+        wss.emit('connection', ws, request);
+    });
+});
 
 wss.on('connection', (ws) => {
-    console.log('WebSocket connected');
+    console.log('✅ WebSocket connected!');
     let audioBuffer = Buffer.alloc(0);
     let streamSid;
 
@@ -29,7 +42,7 @@ wss.on('connection', (ws) => {
         } else if (data.event === 'mark' && data.mark.name === 'user-spoke') {
             if (audioBuffer.length > 4000) {
                 const text = await recognizeSpeech(audioBuffer);
-                audioBuffer = Buffer.alloc(0); // Clear buffer
+                audioBuffer = Buffer.alloc(0);
                 if (text) {
                     console.log('🗣️ You said:', text);
                     await handleAIResponse(ws, text, streamSid);
@@ -46,31 +59,40 @@ wss.on('connection', (ws) => {
 });
 
 async function handleAIResponse(ws, text, streamSid) {
-    const completion = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
-        messages: [{ role: 'system', content: 'You are a helpful voice assistant.' }, { role: 'user', content: text }],
-    });
-    const aiReply = completion.choices[0].message.content;
-    console.log('🤖 AI reply:', aiReply);
+    try {
+        const completion = await openai.chat.completions.create({
+            model: 'gpt-4o-mini',
+            messages: [{ role: 'system', content: 'You are a helpful voice assistant.' }, { role: 'user', content: text }],
+        });
+        const aiReply = completion.choices[0].message.content;
+        console.log('🤖 AI reply:', aiReply);
 
-    const audioBuffer = await createGoogleTTSAudio(aiReply);
-    ws.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'ai-reply-start' } }));
-    await streamAudioToTwilio(ws, audioBuffer, streamSid);
-    ws.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'ai-reply-end' } }));
+        const audioBuffer = await createGoogleTTSAudio(aiReply);
+        ws.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'ai-reply-start' } }));
+        await streamAudioToTwilio(ws, audioBuffer, streamSid);
+        ws.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'ai-reply-end' } }));
+    } catch(e) {
+        console.error('Error in AI Response:', e);
+    }
 }
 
 async function createGoogleTTSAudio(text) {
-    const [response] = await ttsClient.synthesizeSpeech({
-        input: { text },
-        voice: { languageCode: 'en-US', name: 'en-US-Standard-C' },
-        audioConfig: { audioEncoding: 'LINEAR16', sampleRateHertz: 8000 },
-    });
-    return response.audioContent;
+    try {
+        const [response] = await ttsClient.synthesizeSpeech({
+            input: { text },
+            voice: { languageCode: 'en-US', name: 'en-US-Standard-C' },
+            audioConfig: { audioEncoding: 'LINEAR16', sampleRateHertz: 8000 },
+        });
+        return response.audioContent;
+    } catch(e) {
+        console.error('Google TTS Error:', e);
+        return null;
+    }
 }
 
 async function streamAudioToTwilio(ws, audioBuffer, streamSid) {
     if (!audioBuffer) return;
-    const chunkSize = 320; // 20ms of 8kHz 16-bit mono audio
+    const chunkSize = 320;
     for (let i = 0; i < audioBuffer.length; i += chunkSize) {
         const chunk = audioBuffer.slice(i, i + chunkSize);
         ws.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }));
@@ -78,18 +100,26 @@ async function streamAudioToTwilio(ws, audioBuffer, streamSid) {
     }
 }
 
-// Whisper transcription needs a file-like object
 async function recognizeSpeech(pcmBuffer) {
     try {
+        const file = {
+            value: pcmBuffer,
+            name: 'audio.raw',
+            type: 'audio/l16; rate=8000' // Ensure this matches your audio format
+        };
         const transcription = await openai.audio.transcriptions.create({
-            file: { value: pcmBuffer, name: 'audio.raw', type: 'audio/l16; rate=8000' },
+            file: file,
             model: 'whisper-1'
         });
         return transcription.text;
     } catch (e) {
-        console.error('Whisper error:', e);
+        console.error('Whisper Error:', e);
         return null;
     }
 }
 
-console.log(`WebSocket server listening on port ${process.env.PORT || 3000}`);
+// --- Start the server ---
+const port = process.env.PORT || 3000;
+server.listen(port, () => {
+    console.log(`Server listening for HTTP and WebSocket requests on port ${port}`);
+});

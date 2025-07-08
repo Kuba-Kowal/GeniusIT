@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "Node.js WebSocket server for Twilio AI voice agent integration",
   "main": "server.js",
-  "type": "module"
+  "type": "module",
   "scripts": {
     "start": "node server.js"
   },

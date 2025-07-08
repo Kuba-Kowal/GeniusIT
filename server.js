@@ -116,27 +116,28 @@ async function streamAudioToTwilio(ws, audioBuffer, streamSid) {
   const chunkSize = 320;
   for (let i = 0; i < audioBuffer.length; i += chunkSize) {
     if (ws.readyState === ws.OPEN) {
-      ws.send(JSON.stringify({ event: 'media', streamSid, media: { payload: Buffer.from(chunk).toString('base64') } }));
+      const chunk = audioBuffer.slice(i, i + chunkSize);
+      // CORRECTED THIS LINE: The payload needs to be the chunk itself.
+      ws.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }));
       await new Promise(resolve => setTimeout(resolve, 20));
+    } else {
+      break;
     }
   }
   console.log('Finished streaming audio.');
 }
 
-/**
- * Transcribes audio using OpenAI Whisper.
- * This version correctly formats the buffer for the API.
- */
 async function recognizeSpeech(pcmBuffer) {
   try {
     console.log('Transcribing audio with Whisper...');
-    // The OpenAI library expects a File-like object. We create one in memory here.
-    const audioFile = new File([pcmBuffer], "audio.raw");
-
+    // CORRECTED THIS PART: The OpenAI library can handle a buffer directly if we give it a dummy file name.
     const transcription = await openai.audio.transcriptions.create({
-      file: audioFile,
-      model: 'whisper-1',
-    });
+        file: {
+          value: pcmBuffer,
+          name: "audio.raw",
+        },
+        model: "whisper-1",
+      });
     return transcription.text;
   } catch (e) {
     console.error('Whisper Error:', e);

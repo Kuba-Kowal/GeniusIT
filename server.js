@@ -1,85 +1,60 @@
 import WebSocket, { WebSocketServer } from 'ws';
-import { config } from 'dotenv';
-import { createChatCompletion } from 'openai'; // OpenAI client v4 (or your preferred)
-import { pipeline } from 'stream/promises';
-import { Transform } from 'stream';
+import fetch from 'node-fetch';
 import { spawn } from 'child_process';
-
-config(); // load .env for OPENAI_API_KEY etc
+import fs from 'fs/promises';
+import path from 'path';
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-if (!OPENAI_API_KEY) throw new Error('Missing OPENAI_API_KEY in env');
+const WP_AI_RESPONSE_URL = 'https://your-wp-site.com/wp-json/twilio/v1/ai-response';
 
 const wss = new WebSocketServer({ port: 8080 });
-
 console.log('WebSocket server listening on ws://localhost:8080');
 
-wss.on('connection', (ws, req) => {
+wss.on('connection', (ws) => {
   console.log('Client connected');
-
-  let transcript = '';
-  let userSessionId = Math.random().toString(36).substring(2, 15);
-
-  // Buffer raw audio from Twilio
   const audioBuffers = [];
+  let callSid = null; // will receive from Twilio in initial event or metadata
 
   ws.on('message', async (msg) => {
-    // Twilio Media Streams sends JSON messages with 'event' and 'media' fields
     try {
       const data = JSON.parse(msg);
 
       if (data.event === 'start') {
-        console.log('Media stream started');
+        callSid = data.start.callSid || 'unknown';
+        console.log('Stream started for callSid:', callSid);
         return;
       }
+
       if (data.event === 'media') {
-        // Extract audio payload (base64-encoded)
-        const audioPayload = data.media.payload; // base64 string
+        const audioPayload = data.media.payload;
         const audioChunk = Buffer.from(audioPayload, 'base64');
         audioBuffers.push(audioChunk);
         return;
       }
+
       if (data.event === 'stop') {
-        console.log('Media stream stopped');
+        console.log('Stream stopped, processing audio for callSid:', callSid);
+        const fullAudio = Buffer.concat(audioBuffers);
+        const wavPath = path.join('/tmp', `${callSid}.wav`);
 
-        // Combine audio chunks into single buffer
-        const fullAudioBuffer = Buffer.concat(audioBuffers);
+        await convertRawToWav(fullAudio, wavPath);
+        const transcript = await transcribeAudio(wavPath);
 
-        // Save buffer to a temp file (wav format expected by Whisper)
-        const tempWavPath = `/tmp/${userSessionId}.wav`;
-
-        // Convert raw audio to wav if needed (Twilio sends PCM mulaw 8khz, so we convert)
-        await convertRawToWav(fullAudioBuffer, tempWavPath);
-
-        // Send audio file to OpenAI Whisper STT
-        const transcription = await transcribeAudio(tempWavPath);
-
-        console.log('Transcription:', transcription);
-
-        if (transcription) {
-          // Send transcription to ChatGPT
-          const responseText = await askChatGPT(transcription);
-          console.log('ChatGPT:', responseText);
-
-          // Send text back to Twilio in the WebSocket (JSON text event)
-          const twilioTextResponse = {
-            event: 'media',
-            media: {
-              payload: Buffer.from(encodeTwilioSay(responseText)).toString('base64'),
-            },
-          };
-          ws.send(JSON.stringify(twilioTextResponse));
-        } else {
-          ws.send(JSON.stringify({
-            event: 'media',
-            media: { payload: Buffer.from(encodeTwilioSay("Sorry, I didn't catch that.")).toString('base64') },
-          }));
+        console.log('Transcript:', transcript);
+        if (!transcript) {
+          await sendAIResponse(callSid, "Sorry, I didn't catch that.");
+          ws.close();
+          return;
         }
 
+        const aiResponse = await askChatGPT(transcript);
+        console.log('AI response:', aiResponse);
+
+        await sendAIResponse(callSid, aiResponse);
         ws.close();
       }
-    } catch (err) {
-      console.error('Error processing message:', err);
+    } catch (e) {
+      console.error('Error:', e);
       ws.close();
     }
   });
@@ -89,7 +64,6 @@ wss.on('connection', (ws, req) => {
   });
 });
 
-// Helper: Convert Twilio PCM mulaw raw audio to WAV using ffmpeg
 async function convertRawToWav(rawBuffer, outputPath) {
   return new Promise((resolve, reject) => {
     const ffmpeg = spawn('ffmpeg', [
@@ -97,55 +71,41 @@ async function convertRawToWav(rawBuffer, outputPath) {
       '-ar', '8000',
       '-ac', '1',
       '-i', 'pipe:0',
-      '-ar', '16000', // Whisper prefers 16kHz
+      '-ar', '16000',
       '-ac', '1',
       '-y',
       outputPath,
     ]);
-
     ffmpeg.stdin.write(rawBuffer);
     ffmpeg.stdin.end();
-
-    ffmpeg.on('close', (code) => {
-      if (code === 0) resolve();
-      else reject(new Error('ffmpeg failed with code ' + code));
-    });
+    ffmpeg.on('close', (code) => (code === 0 ? resolve() : reject(new Error('ffmpeg failed'))));
   });
 }
 
-// Helper: Send audio file to OpenAI Whisper and get transcript
 async function transcribeAudio(filePath) {
-  // Using OpenAI SDK or fetch API
-  // Here's a fetch example for Whisper endpoint
-  const fs = await import('fs/promises');
   const file = await fs.readFile(filePath);
+  const formData = new FormData();
+  formData.append('file', new Blob([file]), 'audio.wav');
+  formData.append('model', 'whisper-1');
 
-  const response = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+  const res = await fetch('https://api.openai.com/v1/audio/transcriptions', {
     method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${OPENAI_API_KEY}`,
-    },
-    body: new FormData()
-      .append('file', new Blob([file]), 'audio.wav')
-      .append('model', 'whisper-1'),
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+    body: formData,
   });
 
-  if (!response.ok) {
-    console.error('Whisper API error:', await response.text());
+  if (!res.ok) {
+    console.error(await res.text());
     return null;
   }
-
-  const data = await response.json();
+  const data = await res.json();
   return data.text;
 }
 
-// Helper: Call ChatGPT with prompt text
 async function askChatGPT(prompt) {
-  // You can use openai client or fetch
-
-  const response = await fetch('https://api.openai.com/v1/chat/completions', {
+  const res = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
-    headers: {
+    headers: { 
       'Authorization': `Bearer ${OPENAI_API_KEY}`,
       'Content-Type': 'application/json',
     },
@@ -155,24 +115,24 @@ async function askChatGPT(prompt) {
       max_tokens: 150,
     }),
   });
-  if (!response.ok) {
-    console.error('ChatGPT API error:', await response.text());
+
+  if (!res.ok) {
+    console.error(await res.text());
     return "Sorry, I am having trouble answering right now.";
   }
-  const data = await response.json();
+
+  const data = await res.json();
   return data.choices[0].message.content.trim();
 }
 
-// Helper: Encode text to Twilio Say audio payload (PCM mulaw base64)
-// Twilio expects audio media payloads, but for text responses you send an event 'message' with 'say' command —
-// However, Twilio Media Streams doesn’t support server-to-client text-to-speech directly in the stream, so instead, you have to respond to the webhook TwiML with <Say> for each bot message.
+async function sendAIResponse(callSid, aiText) {
+  const res = await fetch(WP_AI_RESPONSE_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ callSid, aiText }),
+  });
 
-// So for simplicity, here we just send a silent audio buffer or no audio and rely on Twilio's <Say> in webhook to read the text.
-
-// If you want to stream real audio back to caller, you must generate PCM audio yourself (or TTS) and send as base64 in media.payload.
-
-// For now, just send empty audio (silence)
-function encodeTwilioSay(text) {
-  // Returning empty audio (silence) as a placeholder
-  return Buffer.alloc(320); // 20ms silence PCM mulaw 8kHz mono
+  if (!res.ok) {
+    console.error('Failed to send AI response to WP:', await res.text());
+  }
 }

@@ -30,17 +30,20 @@ wss.on('connection', (ws) => {
   const silenceThreshold = 1200; // 1.2 seconds of silence
 
   const processAudio = async () => {
-    // Stop the timer so it doesn't fire again
+    // CRITICAL FIX: Ensure connection is still open before processing.
+    if (ws.readyState !== ws.OPEN) {
+        return;
+    }
     clearTimeout(silenceTimer);
     silenceTimer = null;
 
     if (audioBuffer.length < 4000) {
-      audioBuffer = Buffer.alloc(0); // Buffer too short, ignore.
+      audioBuffer = Buffer.alloc(0);
       return;
     }
     console.log('Silence detected, processing audio...');
     const text = await recognizeSpeech(audioBuffer);
-    audioBuffer = Buffer.alloc(0); // Clear buffer for next turn
+    audioBuffer = Buffer.alloc(0);
     if (text) {
       console.log('🗣️ You said:', text);
       await handleAIResponse(ws, text, streamSid);
@@ -63,10 +66,7 @@ wss.on('connection', (ws) => {
         break;
       case 'stop':
         console.log(`Twilio media stream stopped: ${streamSid}`);
-        // When the stream stops, clear any pending silence timers.
-        if (silenceTimer) {
-          clearTimeout(silenceTimer);
-        }
+        if (silenceTimer) clearTimeout(silenceTimer);
         ws.close();
         break;
     }
@@ -78,6 +78,9 @@ wss.on('connection', (ws) => {
 
 // --- Core AI and TTS Functions ---
 async function handleAIResponse(ws, text, streamSid, overrideText = null) {
+  // CRITICAL FIX: Ensure connection is still open before handling.
+  if (ws.readyState !== ws.OPEN) return;
+
   let aiReply;
   try {
     if (overrideText) {
@@ -118,25 +121,22 @@ async function streamAudioToTwilio(ws, audioBuffer, streamSid) {
   console.log('Streaming audio back to Twilio...');
   const chunkSize = 320;
   for (let i = 0; i < audioBuffer.length; i += chunkSize) {
+    // CRITICAL FIX: Ensure connection is still open before sending.
     if (ws.readyState === ws.OPEN) {
       const chunk = audioBuffer.slice(i, i + chunkSize);
       ws.send(JSON.stringify({ event: 'media', streamSid, media: { payload: chunk.toString('base64') } }));
       await new Promise(resolve => setTimeout(resolve, 20));
     } else {
+      console.log('WebSocket closed during streaming, stopping.');
       break;
     }
   }
   console.log('Finished streaming audio.');
 }
 
-/**
- * Transcribes audio using OpenAI Whisper.
- * This version correctly formats the buffer for the Node.js SDK.
- */
 async function recognizeSpeech(pcmBuffer) {
   try {
     console.log('Transcribing audio with Whisper...');
-    // The Node.js SDK expects a file-like object with a value (the buffer) and a name.
     const transcription = await openai.audio.transcriptions.create({
         file: {
           value: pcmBuffer,

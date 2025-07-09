@@ -5,8 +5,7 @@ import path from 'path';
 import { tmpdir } from 'os';
 import { OpenAI } from 'openai';
 import textToSpeech from '@google-cloud/text-to-speech';
-import vadPackage from '@ricky0123/vad-web'; // <-- CORRECTED IMPORT
-const { VAD } = vadPackage;                  // <-- CORRECTED IMPORT
+import VAD from '@ricky0123/vad-web'; // <-- CORRECTED IMPORT
 import dotenv from 'dotenv';
 dotenv.config();
 
@@ -135,9 +134,8 @@ wss.on('connection', async (ws, req) => {
     const vad = await VAD.create({
         sampleRate: 8000,
         threshold: 0.65, 
-        minSpeechFrames: 5,
-        maxSpeechFrames: 250,
-        minSilenceFrames: 15,
+        minSpeechFrames: 3,
+        minSilenceFrames: 10,
         onSpeechStart: () => {
             console.log('[VAD] Speech started.');
         },

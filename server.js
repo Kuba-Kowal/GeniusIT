@@ -70,7 +70,7 @@ function encodePCMToMuLaw(pcmSamples) {
 // --- Whisper Speech-to-Text helper ---
 async function transcribeWhisper(rawAudioBuffer) {
   const wavHeader = createWavHeader(rawAudioBuffer.length, {
-    sampleRate: 8000,
+    sampleRate: 16000,
     numChannels: 1,
     bitsPerSample: 16,
   });

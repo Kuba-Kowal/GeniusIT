@@ -122,7 +122,8 @@ async function transcribeWhisper(rawAudioBuffer) {
     const wavBuffer = Buffer.concat([wavHeader, pcm16kBuffer]);
 
     await fs.promises.writeFile(tempFilePath, wavBuffer);
-    console.log(`[Whisper] WAV file written to temp: ${tempFilePath} (${wavBuffer.length} bytes)`);
+    // The log for this line has been removed to keep the console cleaner during operation.
+    // console.log(`[Whisper] WAV file written to temp: ${tempFilePath} (${wavBuffer.length} bytes)`);
 
     const fileStream = fs.createReadStream(tempFilePath);
     const start = Date.now();
@@ -130,7 +131,21 @@ async function transcribeWhisper(rawAudioBuffer) {
     const response = await openai.audio.transcriptions.create({
       file: fileStream,
       model: 'whisper-1',
+      language: 'en', // <-- ADD THIS LINE
     });
+
+    const duration = ((Date.now() - start) / 1000).toFixed(2);
+    console.log(`[Whisper] Transcription done in ${duration}s: "${response.text}"`);
+
+    await fs.promises.unlink(tempFilePath);
+    // console.log('[Whisper] Temp WAV file deleted'); // Also commented out for cleaner logs.
+
+    return response.text;
+  } catch (error) {
+    console.error('[Whisper] Transcription error:', error);
+    throw error;
+  }
+}
 
     const duration = ((Date.now() - start) / 1000).toFixed(2);
     console.log(`[Whisper] Transcription done in ${duration}s: "${response.text}"`);

@@ -1,9 +1,10 @@
-// server.js (Complete version with integrated mu-law encoder, Whisper STT, Google TTS, and Twilio WebSocket support)
+// server.js (With detailed debug logging)
 
 import express from 'express';
 import { WebSocketServer } from 'ws';
-import fs from 'fs';
-import { Readable } from 'stream';
+import fs from 'fs/promises';
+import path from 'path';
+import { tmpdir } from 'os';
 import { OpenAI } from 'openai';
 import textToSpeech from '@google-cloud/text-to-speech';
 import dotenv from 'dotenv';
@@ -43,15 +44,28 @@ function encodePCMToMuLaw(pcmSamples) {
 
 // --- Whisper Speech-to-Text helper ---
 async function transcribeWhisper(audioBuffer) {
+  const tempFilePath = path.join(tmpdir(), `audio_${Date.now()}.wav`);
+
+  await fs.writeFile(tempFilePath, audioBuffer);
+  console.log(`[Whisper] Audio written to temp file: ${tempFilePath} (${audioBuffer.length} bytes)`);
+
+  const start = Date.now();
   const response = await openai.audio.transcriptions.create({
-    file: new File([audioBuffer], 'audio.wav', { type: 'audio/wav' }),
+    file: tempFilePath,
     model: 'whisper-1',
   });
+  const duration = ((Date.now() - start) / 1000).toFixed(2);
+  console.log(`[Whisper] Transcription completed in ${duration}s: "${response.text}"`);
+
+  await fs.unlink(tempFilePath);
+  console.log(`[Whisper] Temp file deleted`);
+
   return response.text;
 }
 
 // --- Google TTS helper ---
 async function speakText(text) {
+  console.log(`[TTS] Synthesizing text: "${text}"`);
   const [response] = await ttsClient.synthesizeSpeech({
     input: { text },
     voice: { languageCode: 'en-US', ssmlGender: 'NEUTRAL' },
@@ -59,55 +73,82 @@ async function speakText(text) {
   });
 
   const audioBuffer = response.audioContent;
-  const int16Buffer = new Int16Array(new Uint8Array(audioBuffer).buffer);
+  const audioDataBuffer = Buffer.isBuffer(audioBuffer)
+    ? audioBuffer
+    : Buffer.from(audioBuffer, 'base64');
+
+  console.log(`[TTS] Audio synthesized: ${audioDataBuffer.length} bytes`);
+
+  const int16Buffer = new Int16Array(audioDataBuffer.buffer, audioDataBuffer.byteOffset, audioDataBuffer.byteLength / 2);
+
   return encodePCMToMuLaw(int16Buffer);
 }
 
 // --- WebSocket connection for Twilio Media Streams ---
 wss.on('connection', (ws) => {
   let audioChunks = [];
+  let callStartedAt = null;
 
   ws.on('message', async (message) => {
-    const msg = JSON.parse(message);
+    try {
+      const msg = JSON.parse(message);
 
-    if (msg.event === 'start') {
-      console.log('Call started');
-    } else if (msg.event === 'media') {
-      const payload = Buffer.from(msg.media.payload, 'base64');
-      audioChunks.push(payload);
-    } else if (msg.event === 'stop') {
-      console.log('Call stopped. Transcribing...');
+      if (msg.event === 'start') {
+        console.log(`[Call] Call started`);
+        audioChunks = [];
+        callStartedAt = Date.now();
+      } else if (msg.event === 'media') {
+        const payload = Buffer.from(msg.media.payload, 'base64');
+        audioChunks.push(payload);
+        // Log payload size every 1 second approx
+        if (audioChunks.length % 50 === 0) {
+          const totalBytes = audioChunks.reduce((a, b) => a + b.length, 0);
+          console.log(`[Audio] Collected ${audioChunks.length} chunks, total size: ${totalBytes} bytes`);
+        }
+      } else if (msg.event === 'stop') {
+        const callDuration = ((Date.now() - callStartedAt) / 1000).toFixed(2);
+        console.log(`[Call] Call stopped after ${callDuration}s, processing transcription...`);
 
-      const audioBuffer = Buffer.concat(audioChunks);
-      const transcript = await transcribeWhisper(audioBuffer);
-      console.log('You said:', transcript);
+        const audioBuffer = Buffer.concat(audioChunks);
+        console.log(`[Audio] Total audio size before transcription: ${audioBuffer.length} bytes`);
 
-      const chat = await openai.chat.completions.create({
-        model: 'gpt-4o',
-        messages: [{ role: 'user', content: transcript }],
-      });
+        const transcript = await transcribeWhisper(audioBuffer);
+        console.log(`[Transcription] You said: "${transcript}"`);
 
-      const reply = chat.choices[0].message.content;
-      const ttsAudio = await speakText(reply);
+        const chatStart = Date.now();
+        const chat = await openai.chat.completions.create({
+          model: 'gpt-4o-mini',
+          messages: [{ role: 'user', content: transcript }],
+        });
+        const chatDuration = ((Date.now() - chatStart) / 1000).toFixed(2);
+        const reply = chat.choices[0].message.content;
+        console.log(`[ChatGPT] Response generated in ${chatDuration}s: "${reply}"`);
 
-      // Send TTS audio as media messages back to Twilio
-      for (let i = 0; i < ttsAudio.length; i += 320) {
-        const slice = ttsAudio.slice(i, i + 320);
-        ws.send(
-          JSON.stringify({
-            event: 'media',
-            media: { payload: slice.toString('base64') },
-          })
-        );
-        await new Promise((r) => setTimeout(r, 20)); // 20ms = 160 samples @ 8kHz
+        const ttsAudio = await speakText(reply);
+        console.log(`[Audio] TTS audio length: ${ttsAudio.length} bytes`);
+
+        console.log(`[Streaming] Sending TTS audio back in chunks...`);
+        for (let i = 0; i < ttsAudio.length; i += 320) {
+          const slice = ttsAudio.slice(i, i + 320);
+          ws.send(
+            JSON.stringify({
+              event: 'media',
+              media: { payload: slice.toString('base64') },
+            })
+          );
+          await new Promise((r) => setTimeout(r, 20));
+        }
+        console.log(`[Streaming] Finished sending TTS audio.`);
       }
+    } catch (error) {
+      console.error(`[Error] WebSocket message handler error:`, error);
     }
   });
 });
 
 // --- Express route to upgrade to WebSocket ---
 const server = app.listen(process.env.PORT || 3000, () => {
-  console.log('Server listening');
+  console.log('Server listening on port', process.env.PORT || 3000);
 });
 
 server.on('upgrade', (req, socket, head) => {

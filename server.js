@@ -48,29 +48,6 @@ function createWavHeader(dataLength, options = {}) {
   return buffer;
 }
 
-function linearToMuLaw(sample) {
-  const MU = 255;
-  const BIAS = 0x84;
-  const CLIP = 32635;
-  let sign = (sample < 0) ? 0x80 : 0x00;
-  if (sample < 0) sample = -sample;
-  if (sample > CLIP) sample = CLIP;
-  sample = sample + BIAS;
-  let exponent = 7;
-  for (let expMask = 0x4000; (sample & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1);
-  let mantissa = (sample >> (exponent + 3)) & 0x0F;
-  let muLawByte = ~(sign | (exponent << 4) | mantissa);
-  return muLawByte & 0xFF;
-}
-
-function encodePCMToMuLaw(pcmSamples) {
-  const muLawBuffer = Buffer.alloc(pcmSamples.length);
-  for (let i = 0; i < pcmSamples.length; i++) {
-    muLawBuffer[i] = linearToMuLaw(pcmSamples[i]);
-  }
-  return muLawBuffer;
-}
-
 function muLawToLinear(muLawByte) {
   const MULAW_BIAS = 33;
   muLawByte = ~muLawByte & 0xFF;
@@ -81,12 +58,13 @@ function muLawToLinear(muLawByte) {
   return sign * sample;
 }
 
-function decodeMuLawBuffer(muLawBuffer) {
-  const pcmSamples = new Int16Array(muLawBuffer.length);
-  for (let i = 0; i < muLawBuffer.length; i++) {
-    pcmSamples[i] = muLawToLinear(muLawBuffer[i]);
-  }
-  return pcmSamples;
+function decodeMuLawTo16BitPCM(muLawBuffer) {
+  const pcmSamples = new Int16Array(muLawBuffer.length);
+  for (let i = 0; i < muLawBuffer.length; i++) {
+    pcmSamples[i] = muLawToLinear(muLawBuffer[i]);
+  }
+  // node-vad needs a Buffer of 16-bit PCM data
+  return Buffer.from(pcmSamples.buffer);
 }
 
 function resample8kTo16k(inputSamples) {
@@ -100,10 +78,11 @@ function resample8kTo16k(inputSamples) {
   return outputSamples;
 }
 
-async function transcribeWhisper(rawAudioBuffer) {
+async function transcribeWhisper(raw8kHzPcmBuffer) {
   console.log('[Whisper] Starting transcription');
   try {
-    const pcm8kSamples = decodeMuLawBuffer(rawAudioBuffer);
+    // We now receive 8kHz PCM, so we just need to resample it
+    const pcm8kSamples = new Int16Array(raw8kHzPcmBuffer.buffer, raw8kHzPcmBuffer.byteOffset, raw8kHzPcmBuffer.length / 2);
     const pcm16kSamples = resample8kTo16k(pcm8kSamples);
     const pcm16kBuffer = Buffer.from(pcm16kSamples.buffer);
     const wavHeader = createWavHeader(pcm16kBuffer.length);
@@ -142,89 +121,116 @@ async function speakText(text) {
     console.log(`[TTS] Audio synthesized: ${audioDataBuffer.length} bytes`);
     const alignedBuffer = audioDataBuffer.byteOffset % 2 === 0 ? audioDataBuffer : Buffer.from(audioDataBuffer);
     const int16Buffer = new Int16Array(alignedBuffer.buffer, alignedBuffer.byteOffset, alignedBuffer.byteLength / 2);
-    return encodePCMToMuLaw(int16Buffer);
+    // This function needs to convert LINEAR16 PCM back to µ-law for Twilio
+    const muLawSamples = new Uint8Array(int16Buffer.length);
+    for (let i = 0; i < int16Buffer.length; i++) {
+        muLawSamples[i] = linearToMuLaw(int16Buffer[i]);
+    }
+    return Buffer.from(muLawSamples);
   } catch (error) {
     console.error('[TTS] Synthesis error:', error);
     throw error;
   }
 }
 
+
 wss.on('connection', async (ws, req) => {
   console.log('[WS] New connection established');
 
   const vad = new VAD(VAD.Mode.NORMAL);
-  const audioStream = new VAD.Stream({
-    mode: VAD.Mode.NORMAL,
-    audioFrequency: 8000,
-    debounceTime: 1000,
-  });
 
+  let isSpeaking = false;
+  let speechBuffer = [];
+  let silenceTimeout = null;
   let isTranscribing = false;
 
-  audioStream.on('data', async (data) => {
-    if (data.speech.state === VAD.SpeechState.SPEECH) {
-      // Speech is happening, do nothing until it ends
-    } else if (data.speech.state === VAD.SpeechState.SILENCE) {
-      const speechBuffer = data.audioData;
-      if (speechBuffer.length < 1600) { // Ignore very short silences/blips
+  const processUtterance = async () => {
+    if (isTranscribing) {
+      console.log('[Process] Already transcribing, skipping utterance.');
+      return;
+    }
+    
+    isTranscribing = true;
+    try {
+      const completeSpeech = Buffer.concat(speechBuffer);
+      speechBuffer = []; // Clear buffer for next time
+
+      if (completeSpeech.length < 1600) { // Ignore short audio blips
+        console.log('[Process] Utterance too short, ignoring.');
+        return;
+      }
+
+      console.log(`[VAD] Processing utterance of ${completeSpeech.length} bytes.`);
+      const transcript = await transcribeWhisper(completeSpeech);
+      
+      if (!transcript || transcript.trim().length < 2) {
+        console.log('[Process] Empty transcript, skipping.');
         return;
       }
       
-      if (isTranscribing) {
-        console.log('[Process] Still transcribing, skipping this utterance.');
-        return;
-      }
+      console.log(`[Process] Transcript: "${transcript}"`);
+      const chatCompletion = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [{ role: 'user', content: transcript }],
+      });
 
-      console.log(`[VAD] Speech ended, processing ${speechBuffer.length} bytes.`);
-      isTranscribing = true;
+      const reply = chatCompletion.choices[0].message.content;
+      console.log(`[Process] GPT reply: "${reply}"`);
 
-      try {
-        const transcript = await transcribeWhisper(speechBuffer);
-        console.log(`[Process] Transcript: "${transcript}"`);
+      const ttsAudio = await speakText(reply);
+      console.log(`[Process] TTS audio length: ${ttsAudio.length}`);
 
-        if (!transcript || transcript.trim().length < 2) {
-          console.log('[Process] Empty transcript, skipping.');
-          return;
+      for (let i = 0; i < ttsAudio.length; i += 320) {
+        const chunk = ttsAudio.slice(i, i + 320);
+        if (ws.readyState === 1) {
+          ws.send(JSON.stringify({ event: 'media', media: { payload: chunk.toString('base64') } }));
         }
-
-        const chatCompletion = await openai.chat.completions.create({
-          model: 'gpt-4o-mini',
-          messages: [{ role: 'user', content: transcript }],
-        });
-
-        const reply = chatCompletion.choices[0].message.content;
-        console.log(`[Process] GPT reply: "${reply}"`);
-
-        const ttsAudio = await speakText(reply);
-        console.log(`[Process] TTS audio length: ${ttsAudio.length}`);
-
-        for (let i = 0; i < ttsAudio.length; i += 320) {
-          const chunk = ttsAudio.slice(i, i + 320);
-          if (ws.readyState === 1) {
-            ws.send(JSON.stringify({ event: 'media', media: { payload: chunk.toString('base64') } }));
-          }
-          await new Promise(r => setTimeout(r, 20));
-        }
-        console.log('[Process] TTS audio sent.');
-      } catch (error) {
-        console.error('[Process] Error in processing chain:', error);
-      } finally {
-        isTranscribing = false;
+        await new Promise(r => setTimeout(r, 20));
       }
+      console.log('[Process] TTS audio sent.');
+    } catch (error) {
+      console.error('[Process] Error during utterance processing:', error);
+    } finally {
+      isTranscribing = false;
     }
-  });
+  };
 
   ws.on('message', (message) => {
     try {
       const msg = JSON.parse(message.toString());
-      if (msg.event === 'start') {
+      if (msg.event === 'media') {
+        const muLawBuffer = Buffer.from(msg.media.payload, 'base64');
+        const pcmBuffer = decodeMuLawTo16BitPCM(muLawBuffer);
+
+        const vadEvent = vad.process(pcmBuffer);
+
+        if (vadEvent === VAD.Event.VOICE) {
+          if (silenceTimeout) {
+            clearTimeout(silenceTimeout);
+            silenceTimeout = null;
+          }
+          if (!isSpeaking) {
+            console.log('[VAD] Speech started');
+            isSpeaking = true;
+          }
+          speechBuffer.push(muLawBuffer); // Buffer original µ-law data
+        } else if (vadEvent === VAD.Event.SILENCE && isSpeaking) {
+          if (!silenceTimeout) {
+            silenceTimeout = setTimeout(() => {
+              console.log('[VAD] End of utterance detected.');
+              isSpeaking = false;
+              processUtterance();
+              silenceTimeout = null;
+            }, 800); // 800ms of silence marks the end of an utterance
+          }
+        }
+      } else if (msg.event === 'start') {
         console.log('[Call] Started');
-      } else if (msg.event === 'media') {
-        const pcmAudio = Buffer.from(decodeMuLawBuffer(Buffer.from(msg.media.payload, 'base64')).buffer);
-        audioStream.write(pcmAudio);
       } else if (msg.event === 'stop') {
         console.log('[Call] Stopped');
-        audioStream.end();
+        if (isSpeaking) {
+          processUtterance();
+        }
       }
     } catch (error) {
       console.error('[WS] Error handling message:', error);
@@ -233,14 +239,13 @@ wss.on('connection', async (ws, req) => {
 
   ws.on('close', () => {
     console.log('[WS] Connection closed');
-    audioStream.end();
   });
 
   ws.on('error', (err) => {
     console.error('[WS] Connection error:', err);
-    audioStream.end();
   });
 });
+
 
 const server = app.listen(process.env.PORT || 3000, () => {
   console.log(`[HTTP] Server listening on port ${process.env.PORT || 3000}`);

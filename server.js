@@ -5,7 +5,7 @@ import path from 'path';
 import { tmpdir } from 'os';
 import { OpenAI } from 'openai';
 import textToSpeech from '@google-cloud/text-to-speech';
-import { resample } from 'wave-resampler'; // Import the new library
+import resample from 'wave-resampler'; // <-- THIS LINE IS FIXED
 import dotenv from 'dotenv';
 dotenv.config();
 
@@ -91,8 +91,6 @@ function decodeMuLawBuffer(muLawBuffer) {
   }
   return pcmSamples;
 }
-
-// The old `resample8kTo16k` function has been removed.
 
 async function transcribeWhisper(rawAudioBuffer) {
   console.log('[Whisper] Starting transcription');

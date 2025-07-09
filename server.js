@@ -2,7 +2,7 @@
 
 import express from 'express';
 import { WebSocketServer } from 'ws';
-import fs from 'fs';
+import fs from 'fs/promise';
 import path from 'path';
 import { tmpdir } from 'os';
 import { OpenAI } from 'openai';
@@ -43,8 +43,6 @@ function encodePCMToMuLaw(pcmSamples) {
 }
 
 // --- Whisper Speech-to-Text helper ---
-import fs from 'fs';  // make sure you have fs imported
-
 async function transcribeWhisper(audioBuffer) {
   const tempFilePath = path.join(tmpdir(), `audio_${Date.now()}.wav`);
 

@@ -139,9 +139,11 @@ wss.on('connection', async (ws, req) => {
   });
 
   vadStream.on('data', async (data) => {
-      console.log(`[VAD] Stream emitted data. Speech state: ${data.speech.state ? 'SPEECH' : 'SILENCE'}, audio length: ${data.audioData.length}`);
+      // The `data.speech.state` is a boolean: true for speech, false for silence
+      console.log(`[VAD] Stream emitted data. Is speech: ${data.speech.state}, audio length: ${data.audioData.length}`);
       
-      if (data.speech.state === VAD.SpeechState.SILENCE && !isTranscribing) {
+      // We process the audio when the state transitions to SILENCE (false)
+      if (data.speech.state === false && !isTranscribing) {
         const speechAudio = data.audioData;
         if (speechAudio.length < 1024) {
             console.log('[VAD] Audio chunk too short, ignoring.');
@@ -178,7 +180,6 @@ wss.on('connection', async (ws, req) => {
       const msg = JSON.parse(message.toString());
       if (msg.event === 'media') {
         const pcmChunk = decodeMuLawTo16BitPCM(Buffer.from(msg.media.payload, 'base64'));
-        console.log(`[VAD] Writing ${pcmChunk.length} byte chunk to VAD stream.`);
         vadStream.write(pcmChunk);
       } else if (msg.event === 'start') {
         console.log('[Call] Call started.');

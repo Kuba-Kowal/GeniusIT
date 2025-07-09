@@ -57,7 +57,9 @@ async function transcribeWhisper(pcmBuffer) {
     const transcription = await openai.audio.transcriptions.create({
       file: fs.createReadStream(tempFilePath),
       model: 'whisper-1',
+      language: 'en', // Force English transcription
     });
+
 
     const transcript = transcription.text.trim();
     console.log('[Whisper] Transcription done:', `"${transcript}"`);

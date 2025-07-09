@@ -7,6 +7,7 @@ import { fileURLToPath } from 'url';
 import { tmpdir } from 'os';
 import util from 'util';
 import ffmpeg from 'fluent-ffmpeg';
+import { PassThrough } from 'stream';
 
 import textToSpeech from '@google-cloud/text-to-speech';
 import OpenAI from 'openai';
@@ -63,6 +64,24 @@ function pcmToWav(pcmBuffer, sampleRate = 8000) {
         reject(err);
       })
       .save(tmpWavPath);
+  });
+}
+
+// Decode MP3 buffer to raw PCM 16-bit 8kHz mono buffer for Twilio streaming
+function mp3ToPcmBuffer(mp3Buffer) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    const stream = new PassThrough();
+    stream.end(mp3Buffer);
+
+    ffmpeg(stream)
+      .format('s16le')
+      .audioFrequency(8000)
+      .audioChannels(1)
+      .on('error', (err) => reject(err))
+      .on('end', () => resolve(Buffer.concat(chunks)))
+      .pipe()
+      .on('data', (chunk) => chunks.push(chunk));
   });
 }
 
@@ -128,6 +147,28 @@ async function synthesizeSpeech(text) {
   }
 }
 
+// Send raw PCM audio chunks to Twilio WebSocket with 0x00 prefix and spacing for streaming
+async function sendAudioToTwilio(ws, mp3Buffer) {
+  try {
+    const pcmBuffer = await mp3ToPcmBuffer(mp3Buffer);
+
+    const CHUNK_SIZE = 320; // 20ms audio at 16-bit 8kHz mono (160 samples * 2 bytes)
+    for (let i = 0; i < pcmBuffer.length; i += CHUNK_SIZE) {
+      const chunk = pcmBuffer.slice(i, i + CHUNK_SIZE);
+
+      // Prefix each chunk with 0x00 byte as required by Twilio
+      const framedChunk = Buffer.concat([Buffer.from([0x00]), chunk]);
+
+      ws.send(framedChunk);
+
+      // Wait 20ms between chunks to simulate real-time streaming
+      await new Promise((res) => setTimeout(res, 20));
+    }
+  } catch (err) {
+    console.error('[TTS Playback] Error sending audio to Twilio:', err);
+  }
+}
+
 // Socket.IO connection handling
 io.on('connection', (socket) => {
   console.log('[Socket.IO] Client connected:', socket.id);
@@ -141,7 +182,7 @@ io.on('connection', (socket) => {
       const audioChunk = base64ToBuffer(data.audio);
       audioChunks.push(audioChunk);
 
-      // Process every ~5 chunks (you can adjust this count)
+      // Process every ~5 chunks (adjustable)
       if (audioChunks.length >= 5 && !isProcessing) {
         isProcessing = true;
         const combinedPCM = Buffer.concat(audioChunks);
@@ -163,9 +204,7 @@ io.on('connection', (socket) => {
         const ttsAudioBuffer = await synthesizeSpeech(chatResponse);
 
         if (ttsAudioBuffer) {
-          socket.emit('media-response', {
-            audio: Buffer.from(ttsAudioBuffer).toString('base64'),
-          });
+          await sendAudioToTwilio(socket, ttsAudioBuffer);
         }
 
         isProcessing = false;

@@ -5,6 +5,7 @@ import path from 'path';
 import { tmpdir } from 'os';
 import { OpenAI } from 'openai';
 import textToSpeech from '@google-cloud/text-to-speech';
+import { resample } from 'wave-resampler'; // Import the new library
 import dotenv from 'dotenv';
 dotenv.config();
 
@@ -91,32 +92,22 @@ function decodeMuLawBuffer(muLawBuffer) {
   return pcmSamples;
 }
 
-function resample8kTo16k(inputSamples) {
-  const outputLength = inputSamples.length * 2;
-  const outputSamples = new Int16Array(outputLength);
-
-  for (let i = 0; i < inputSamples.length - 1; i++) {
-    outputSamples[2 * i] = inputSamples[i];
-    outputSamples[2 * i + 1] = ((inputSamples[i] + inputSamples[i + 1]) / 2) | 0;
-  }
-  outputSamples[outputLength - 1] = inputSamples[inputSamples.length - 1];
-
-  return outputSamples;
-}
+// The old `resample8kTo16k` function has been removed.
 
 async function transcribeWhisper(rawAudioBuffer) {
   console.log('[Whisper] Starting transcription');
 
   try {
+    // Decode µ-law to 8kHz PCM (Int16)
     const pcm8kSamples = decodeMuLawBuffer(rawAudioBuffer);
-    const pcm16kSamples = resample8kTo16k(pcm8kSamples);
+
+    // Resample using the high-quality library
+    const pcm16kSamples = resample(pcm8kSamples, 8000, 16000);
+
+    // Create a new Buffer from the resampled Int16Array
     const pcm16kBuffer = Buffer.from(pcm16kSamples.buffer);
 
-    const wavHeader = createWavHeader(pcm16kBuffer.length, {
-      sampleRate: 16000,
-      numChannels: 1,
-      bitsPerSample: 16,
-    });
+    const wavHeader = createWavHeader(pcm16kBuffer.length);
 
     const tempFilePath = path.join(tmpdir(), `audio_${Date.now()}.wav`);
     const wavBuffer = Buffer.concat([wavHeader, pcm16kBuffer]);
@@ -129,7 +120,7 @@ async function transcribeWhisper(rawAudioBuffer) {
     const response = await openai.audio.transcriptions.create({
       file: fileStream,
       model: 'whisper-1',
-      language: 'en', // Forcing English transcription
+      language: 'en',
     });
 
     const duration = ((Date.now() - start) / 1000).toFixed(2);
@@ -161,7 +152,6 @@ async function speakText(text) {
 
     console.log(`[TTS] Audio synthesized: ${audioDataBuffer.length} bytes`);
 
-    // Ensure byteOffset is aligned to 2 by creating a copy if needed
     const alignedBuffer = audioDataBuffer.byteOffset % 2 === 0
       ? audioDataBuffer
       : Buffer.from(audioDataBuffer);

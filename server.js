@@ -97,7 +97,7 @@ async function transcribeWhisper(rawAudioBuffer) {
   return response.text;
 }
 
-// --- Google TTS helper (unchanged) ---
+// --- Google TTS helper (fixed for byteOffset alignment) ---
 async function speakText(text) {
   console.log(`[TTS] Synthesizing text: "${text}"`);
   const [response] = await ttsClient.synthesizeSpeech({
@@ -113,9 +113,13 @@ async function speakText(text) {
 
   console.log(`[TTS] Audio synthesized: ${audioDataBuffer.length} bytes`);
 
-  const alignedBuffer = audioDataBuffer.byteOffset % 2 === 0
-    ? audioDataBuffer
-    : audioDataBuffer.slice();
+  let alignedBuffer;
+  if (audioDataBuffer.byteOffset % 2 === 0) {
+    alignedBuffer = audioDataBuffer;
+  } else {
+    // Create a copy with byteOffset = 0 to ensure alignment
+    alignedBuffer = Buffer.from(audioDataBuffer);
+  }
 
   const int16Buffer = new Int16Array(
     alignedBuffer.buffer,

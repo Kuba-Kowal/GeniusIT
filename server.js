@@ -9,12 +9,19 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 const app = express();
-const wss = new WebSocketServer({ noServer: true });
+app.use(express.json());
 
+app.get('/', (req, res) => {
+  console.log('[HTTP] GET / called');
+  res.send('Server is running');
+});
+
+// Setup OpenAI and Google TTS clients
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const ttsClient = new textToSpeech.TextToSpeechClient();
 
-// WAV header generator for PCM 16-bit mono 16000 Hz
+const wss = new WebSocketServer({ noServer: true });
+
 function createWavHeader(dataLength, options = {}) {
   const sampleRate = options.sampleRate || 16000;
   const numChannels = options.numChannels || 1;
@@ -40,43 +47,6 @@ function createWavHeader(dataLength, options = {}) {
   return buffer;
 }
 
-// Mu-law decoder (mulaw 8-bit to linear PCM 16-bit)
-function muLawToLinear(muLawByte) {
-  const MULAW_MAX = 0x1FFF;
-  const MULAW_BIAS = 33;
-  muLawByte = ~muLawByte & 0xFF;
-
-  let sign = (muLawByte & 0x80) ? -1 : 1;
-  let exponent = (muLawByte >> 4) & 0x07;
-  let mantissa = muLawByte & 0x0F;
-  let sample = ((mantissa << 3) + MULAW_BIAS) << exponent;
-  return sign * sample;
-}
-
-// Decode mu-law buffer to Int16Array PCM
-function decodeMuLawBuffer(muLawBuffer) {
-  const pcmSamples = new Int16Array(muLawBuffer.length);
-  for (let i = 0; i < muLawBuffer.length; i++) {
-    pcmSamples[i] = muLawToLinear(muLawBuffer[i]);
-  }
-  return pcmSamples;
-}
-
-// Resample 8kHz PCM to 16kHz PCM (linear interpolation)
-function resample8kTo16k(inputSamples) {
-  const outputLength = inputSamples.length * 2;
-  const outputSamples = new Int16Array(outputLength);
-
-  for (let i = 0; i < inputSamples.length - 1; i++) {
-    outputSamples[2 * i] = inputSamples[i];
-    outputSamples[2 * i + 1] = ((inputSamples[i] + inputSamples[i + 1]) / 2) | 0;
-  }
-  outputSamples[outputLength - 1] = inputSamples[inputSamples.length - 1];
-
-  return outputSamples;
-}
-
-// Encode PCM Int16Array to mu-law Buffer
 function linearToMuLaw(sample) {
   const MU = 255;
   const BIAS = 0x84;
@@ -103,115 +73,173 @@ function encodePCMToMuLaw(pcmSamples) {
   return muLawBuffer;
 }
 
-// Transcribe Whisper from mu-law 8kHz audio buffer
+function muLawToLinear(muLawByte) {
+  const MULAW_BIAS = 33;
+  muLawByte = ~muLawByte & 0xFF;
+
+  let sign = (muLawByte & 0x80) ? -1 : 1;
+  let exponent = (muLawByte >> 4) & 0x07;
+  let mantissa = muLawByte & 0x0F;
+  let sample = ((mantissa << 3) + MULAW_BIAS) << exponent;
+  return sign * sample;
+}
+
+function decodeMuLawBuffer(muLawBuffer) {
+  const pcmSamples = new Int16Array(muLawBuffer.length);
+  for (let i = 0; i < muLawBuffer.length; i++) {
+    pcmSamples[i] = muLawToLinear(muLawBuffer[i]);
+  }
+  return pcmSamples;
+}
+
+function resample8kTo16k(inputSamples) {
+  const outputLength = inputSamples.length * 2;
+  const outputSamples = new Int16Array(outputLength);
+
+  for (let i = 0; i < inputSamples.length - 1; i++) {
+    outputSamples[2 * i] = inputSamples[i];
+    outputSamples[2 * i + 1] = ((inputSamples[i] + inputSamples[i + 1]) / 2) | 0;
+  }
+  outputSamples[outputLength - 1] = inputSamples[inputSamples.length - 1];
+
+  return outputSamples;
+}
+
 async function transcribeWhisper(rawAudioBuffer) {
-  const pcm8kSamples = decodeMuLawBuffer(rawAudioBuffer);
-  const pcm16kSamples = resample8kTo16k(pcm8kSamples);
-  const pcm16kBuffer = Buffer.from(pcm16kSamples.buffer);
+  console.log('[Whisper] Starting transcription');
 
-  const wavHeader = createWavHeader(pcm16kBuffer.length, {
-    sampleRate: 16000,
-    numChannels: 1,
-    bitsPerSample: 16,
-  });
+  try {
+    const pcm8kSamples = decodeMuLawBuffer(rawAudioBuffer);
+    const pcm16kSamples = resample8kTo16k(pcm8kSamples);
+    const pcm16kBuffer = Buffer.from(pcm16kSamples.buffer);
 
-  const wavBuffer = Buffer.concat([wavHeader, pcm16kBuffer]);
+    const wavHeader = createWavHeader(pcm16kBuffer.length, {
+      sampleRate: 16000,
+      numChannels: 1,
+      bitsPerSample: 16,
+    });
 
-  const tempFilePath = path.join(tmpdir(), `audio_${Date.now()}.wav`);
-  await fs.promises.writeFile(tempFilePath, wavBuffer);
-  console.log(`[Whisper] WAV file saved: ${tempFilePath} (${wavBuffer.length} bytes)`);
+    const tempFilePath = path.join(tmpdir(), `audio_${Date.now()}.wav`);
+    const wavBuffer = Buffer.concat([wavHeader, pcm16kBuffer]);
 
-  const fileStream = fs.createReadStream(tempFilePath);
+    await fs.promises.writeFile(tempFilePath, wavBuffer);
+    console.log(`[Whisper] WAV file written to temp: ${tempFilePath} (${wavBuffer.length} bytes)`);
 
-  const start = Date.now();
-  const response = await openai.audio.transcriptions.create({
-    file: fileStream,
-    model: 'whisper-1',
-  });
-  const duration = ((Date.now() - start) / 1000).toFixed(2);
-  console.log(`[Whisper] Transcription completed in ${duration}s: "${response.text}"`);
+    const fileStream = fs.createReadStream(tempFilePath);
+    const start = Date.now();
 
-  await fs.promises.unlink(tempFilePath);
-  console.log(`[Whisper] Temp WAV deleted`);
+    const response = await openai.audio.transcriptions.create({
+      file: fileStream,
+      model: 'whisper-1',
+    });
 
-  return response.text;
+    const duration = ((Date.now() - start) / 1000).toFixed(2);
+    console.log(`[Whisper] Transcription done in ${duration}s: "${response.text}"`);
+
+    await fs.promises.unlink(tempFilePath);
+    console.log('[Whisper] Temp WAV file deleted');
+
+    return response.text;
+  } catch (error) {
+    console.error('[Whisper] Transcription error:', error);
+    throw error;
+  }
 }
 
-// Google TTS: text to mu-law encoded audio Buffer
 async function speakText(text) {
-  console.log(`[TTS] Synthesizing: "${text}"`);
-  const [response] = await ttsClient.synthesizeSpeech({
-    input: { text },
-    voice: { languageCode: 'en-US', ssmlGender: 'NEUTRAL' },
-    audioConfig: { audioEncoding: 'LINEAR16' },
-  });
+  console.log(`[TTS] Synthesizing text: "${text}"`);
 
-  const audioBuffer = response.audioContent;
-  const audioDataBuffer = Buffer.isBuffer(audioBuffer)
-    ? audioBuffer
-    : Buffer.from(audioBuffer, 'base64');
+  try {
+    const [response] = await ttsClient.synthesizeSpeech({
+      input: { text },
+      voice: { languageCode: 'en-US', ssmlGender: 'NEUTRAL' },
+      audioConfig: { audioEncoding: 'LINEAR16' },
+    });
 
-  const int16Buffer = new Int16Array(
-    audioDataBuffer.buffer,
-    audioDataBuffer.byteOffset,
-    audioDataBuffer.byteLength / 2
-  );
+    const audioBuffer = response.audioContent;
+    const audioDataBuffer = Buffer.isBuffer(audioBuffer)
+      ? audioBuffer
+      : Buffer.from(audioBuffer, 'base64');
 
-  const muLawAudio = encodePCMToMuLaw(int16Buffer);
-  console.log(`[TTS] Synthesized ${muLawAudio.length} bytes mu-law audio`);
-  return muLawAudio;
+    console.log(`[TTS] Audio synthesized: ${audioDataBuffer.length} bytes`);
+
+    // Align buffer if needed
+    const alignedBuffer = audioDataBuffer.byteOffset % 2 === 0
+      ? audioDataBuffer
+      : audioDataBuffer.slice();
+
+    const int16Buffer = new Int16Array(
+      alignedBuffer.buffer,
+      alignedBuffer.byteOffset,
+      alignedBuffer.byteLength / 2
+    );
+
+    return encodePCMToMuLaw(int16Buffer);
+  } catch (error) {
+    console.error('[TTS] Synthesis error:', error);
+    throw error;
+  }
 }
 
-// WebSocket connection handler
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
+  console.log('[WS] New connection from:', req.socket.remoteAddress);
+
   let audioChunks = [];
   let isTranscribing = false;
   let intervalId = null;
 
   async function processPartialAudio() {
-    if (isTranscribing) return;
-    if (audioChunks.length === 0) return;
+    if (isTranscribing) {
+      console.log('[Process] Still transcribing, skipping this interval');
+      return;
+    }
+    if (audioChunks.length === 0) {
+      console.log('[Process] No audio chunks to process');
+      return;
+    }
 
     isTranscribing = true;
     try {
       const audioBuffer = Buffer.concat(audioChunks);
-      console.log(`[Partial] Processing ${audioBuffer.length} bytes audio`);
+      console.log(`[Process] Processing audio buffer length: ${audioBuffer.length}`);
 
-      const partialTranscript = await transcribeWhisper(audioBuffer);
-      if (!partialTranscript.trim()) {
-        console.log(`[Partial] Empty transcript, skipping response`);
+      const transcript = await transcribeWhisper(audioBuffer);
+      console.log(`[Process] Transcript: "${transcript}"`);
+
+      if (!transcript || transcript.trim() === '') {
+        console.log('[Process] Empty transcript, skipping TTS');
         audioChunks = [];
         isTranscribing = false;
         return;
       }
-      console.log(`[Partial Transcript] "${partialTranscript}"`);
 
-      const chat = await openai.chat.completions.create({
+      const chatCompletion = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
-        messages: [{ role: 'user', content: partialTranscript }],
+        messages: [{ role: 'user', content: transcript }],
       });
-      const reply = chat.choices[0].message.content;
-      console.log(`[Partial ChatGPT] "${reply}"`);
+
+      const reply = chatCompletion.choices[0].message.content;
+      console.log(`[Process] GPT reply: "${reply}"`);
 
       const ttsAudio = await speakText(reply);
-      console.log(`[Partial TTS] Audio length: ${ttsAudio.length}`);
+      console.log(`[Process] TTS audio length: ${ttsAudio.length}`);
 
-      // Stream TTS audio in 320-byte frames with slight delay
+      // Send TTS audio in 320-byte chunks with slight delay
       for (let i = 0; i < ttsAudio.length; i += 320) {
-        const slice = ttsAudio.slice(i, i + 320);
+        const chunk = ttsAudio.slice(i, i + 320);
         ws.send(
           JSON.stringify({
             event: 'media',
-            media: { payload: slice.toString('base64') },
+            media: { payload: chunk.toString('base64') },
           })
         );
-        await new Promise((r) => setTimeout(r, 20));
+        await new Promise(r => setTimeout(r, 20));
       }
-      console.log(`[Partial] Sent TTS audio`);
+      console.log('[Process] Sent TTS audio chunks');
 
       audioChunks = [];
     } catch (error) {
-      console.error('[Partial Error]', error);
+      console.error('[Process] Error processing audio:', error);
     } finally {
       isTranscribing = false;
     }
@@ -219,43 +247,58 @@ wss.on('connection', (ws) => {
 
   ws.on('message', async (message) => {
     try {
-      const msg = JSON.parse(message);
+      const msg = JSON.parse(message.toString());
+      // Log raw incoming message for debugging
+      console.log('[WS] Received message event:', msg.event);
 
       if (msg.event === 'start') {
-        console.log(`[Call] Started`);
+        console.log('[Call] Call started');
         audioChunks = [];
+        if (intervalId) clearInterval(intervalId);
         intervalId = setInterval(processPartialAudio, 5000);
       } else if (msg.event === 'media') {
         const payload = Buffer.from(msg.media.payload, 'base64');
         audioChunks.push(payload);
+        console.log(`[Call] Received media chunk: ${payload.length} bytes`);
       } else if (msg.event === 'stop') {
+        console.log('[Call] Call stopped');
         if (intervalId) {
           clearInterval(intervalId);
           intervalId = null;
         }
-        console.log(`[Call] Stopped - processing remaining audio`);
-        if (audioChunks.length > 0) await processPartialAudio();
+        if (audioChunks.length > 0) {
+          console.log('[Call] Processing remaining audio on stop');
+          await processPartialAudio();
+        }
+      } else {
+        console.log('[WS] Unknown event:', msg.event);
       }
     } catch (error) {
-      console.error(`[Error] WebSocket message handler:`, error);
+      console.error('[WS] Error handling message:', error);
     }
   });
 
   ws.on('close', () => {
+    console.log('[WS] Connection closed by client');
     if (intervalId) {
       clearInterval(intervalId);
       intervalId = null;
     }
-    console.log(`[Connection] Closed`);
+  });
+
+  ws.on('error', (err) => {
+    console.error('[WS] Connection error:', err);
   });
 });
 
 const server = app.listen(process.env.PORT || 3000, () => {
-  console.log('Server listening on port', process.env.PORT || 3000);
+  console.log(`[HTTP] Server listening on port ${process.env.PORT || 3000}`);
 });
 
 server.on('upgrade', (req, socket, head) => {
+  console.log('[WS] Upgrade request received');
   wss.handleUpgrade(req, socket, head, (ws) => {
+    console.log('[WS] WebSocket connection established');
     wss.emit('connection', ws, req);
   });
 });

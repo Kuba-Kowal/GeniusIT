@@ -133,16 +133,14 @@ wss.on('connection', async (ws, req) => {
   let isTranscribing = false;
 
   const vadStream = VAD.createStream({
-      mode: VAD.Mode.NORMAL,
+      mode: VAD.Mode.AGGRESSIVE, // Changed from NORMAL to AGGRESSIVE
       audioFrequency: 8000,
       debounceTime: 1000,
   });
 
   vadStream.on('data', async (data) => {
-      // The `data.speech.state` is a boolean: true for speech, false for silence
       console.log(`[VAD] Stream emitted data. Is speech: ${data.speech.state}, audio length: ${data.audioData.length}`);
       
-      // We process the audio when the state transitions to SILENCE (false)
       if (data.speech.state === false && !isTranscribing) {
         const speechAudio = data.audioData;
         if (speechAudio.length < 1024) {

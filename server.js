@@ -16,7 +16,6 @@ app.get('/', (req, res) => {
   res.send('Server is running');
 });
 
-// Setup OpenAI and Google TTS clients
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const ttsClient = new textToSpeech.TextToSpeechClient();
 
@@ -224,7 +223,7 @@ wss.on('connection', (ws, req) => {
       const ttsAudio = await speakText(reply);
       console.log(`[Process] TTS audio length: ${ttsAudio.length}`);
 
-      // Send TTS audio in 320-byte chunks with slight delay
+      // Send TTS audio in 320-byte chunks with slight delay for smooth streaming
       for (let i = 0; i < ttsAudio.length; i += 320) {
         const chunk = ttsAudio.slice(i, i + 320);
         ws.send(
@@ -248,7 +247,6 @@ wss.on('connection', (ws, req) => {
   ws.on('message', async (message) => {
     try {
       const msg = JSON.parse(message.toString());
-      // Log raw incoming message for debugging
       console.log('[WS] Received message event:', msg.event);
 
       if (msg.event === 'start') {
@@ -296,9 +294,7 @@ const server = app.listen(process.env.PORT || 3000, () => {
 });
 
 server.on('upgrade', (req, socket, head) => {
-  console.log('[WS] Upgrade request received');
   wss.handleUpgrade(req, socket, head, (ws) => {
-    console.log('[WS] WebSocket connection established');
     wss.emit('connection', ws, req);
   });
 });

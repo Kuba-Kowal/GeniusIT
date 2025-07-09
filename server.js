@@ -5,13 +5,16 @@ import path from 'path';
 import { tmpdir } from 'os';
 import { OpenAI } from 'openai';
 import textToSpeech from '@google-cloud/text-to-speech';
-import waveResampler from 'wave-resampler'; // <-- Correctly import the module object
-const { resample } = waveResampler;     // <-- Extract the function from the object
 import dotenv from 'dotenv';
 dotenv.config();
 
 const app = express();
 app.use(express.json());
+
+// --- DEBUGGING: Serve audio files from the temp directory ---
+const tempDir = tmpdir();
+app.use('/downloads', express.static(tempDir));
+// ---------------------------------------------------------
 
 app.get('/', (req, res) => {
   console.log('[HTTP] GET / called');
@@ -93,25 +96,44 @@ function decodeMuLawBuffer(muLawBuffer) {
   return pcmSamples;
 }
 
+function resample8kTo16k(inputSamples) {
+  const outputLength = inputSamples.length * 2;
+  const outputSamples = new Int16Array(outputLength);
+
+  for (let i = 0; i < inputSamples.length - 1; i++) {
+    outputSamples[2 * i] = inputSamples[i];
+    outputSamples[2 * i + 1] = ((inputSamples[i] + inputSamples[i + 1]) / 2) | 0;
+  }
+  outputSamples[outputLength - 1] = inputSamples[inputSamples.length - 1];
+
+  return outputSamples;
+}
+
+
 async function transcribeWhisper(rawAudioBuffer) {
   console.log('[Whisper] Starting transcription');
 
   try {
-    // Decode µ-law to 8kHz PCM (Int16)
     const pcm8kSamples = decodeMuLawBuffer(rawAudioBuffer);
-
-    // Resample using the high-quality library
-    const pcm16kSamples = resample(pcm8kSamples, 8000, 16000);
-
-    // Create a new Buffer from the resampled Int16Array
+    const pcm16kSamples = resample8kTo16k(pcm8kSamples);
     const pcm16kBuffer = Buffer.from(pcm16kSamples.buffer);
 
-    const wavHeader = createWavHeader(pcm16kBuffer.length);
+    const wavHeader = createWavHeader(pcm16kBuffer.length, {
+      sampleRate: 16000,
+      numChannels: 1,
+      bitsPerSample: 16,
+    });
 
-    const tempFilePath = path.join(tmpdir(), `audio_${Date.now()}.wav`);
+    const fileName = `audio_${Date.now()}.wav`;
+    const tempFilePath = path.join(tempDir, fileName);
     const wavBuffer = Buffer.concat([wavHeader, pcm16kBuffer]);
 
     await fs.promises.writeFile(tempFilePath, wavBuffer);
+    
+    // --- DEBUGGING: Log the public URL of the WAV file ---
+    const publicUrl = `https://${process.env.RENDER_EXTERNAL_HOSTNAME}/downloads/${fileName}`;
+    console.log(`[Whisper] WAV file available for download at: ${publicUrl}`);
+    // ---------------------------------------------------
 
     const fileStream = fs.createReadStream(tempFilePath);
     const start = Date.now();
@@ -125,7 +147,8 @@ async function transcribeWhisper(rawAudioBuffer) {
     const duration = ((Date.now() - start) / 1000).toFixed(2);
     console.log(`[Whisper] Transcription done in ${duration}s: "${response.text}"`);
 
-    await fs.promises.unlink(tempFilePath);
+    // The line to delete the file is removed for debugging.
+    // await fs.promises.unlink(tempFilePath);
 
     return response.text;
   } catch (error) {

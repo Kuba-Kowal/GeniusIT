@@ -1,6 +1,6 @@
 import express from "express";
 import http from "http";
-import WebSocket from "ws";
+import WebSocket, { WebSocketServer } from "ws";
 import fs from "fs";
 import path from "path";
 import { pipeline } from "stream";
@@ -11,7 +11,7 @@ import { v4 as uuidv4 } from "uuid";
 
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ noServer: true });
+const wss = new WebSocketServer({ noServer: true });
 
 const PORT = process.env.PORT || 10000;
 

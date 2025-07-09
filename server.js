@@ -5,7 +5,7 @@ import fs from "fs";
 import path from "path";
 import { pipeline } from "stream";
 import { spawn } from "child_process";
-import { Configuration, OpenAIApi } from "openai";
+import OpenAIApi from "openai";
 import textToSpeech from "@google-cloud/text-to-speech";
 import { v4 as uuidv4 } from "uuid";
 
@@ -16,10 +16,9 @@ const wss = new WebSocket.Server({ noServer: true });
 const PORT = process.env.PORT || 10000;
 
 // Setup OpenAI API
-const openaiConfig = new Configuration({
+const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
-const openai = new OpenAIApi(openaiConfig);
 
 // Setup Google TTS client
 const ttsClient = new textToSpeech.TextToSpeechClient();

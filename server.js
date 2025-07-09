@@ -122,8 +122,6 @@ async function transcribeWhisper(rawAudioBuffer) {
     const wavBuffer = Buffer.concat([wavHeader, pcm16kBuffer]);
 
     await fs.promises.writeFile(tempFilePath, wavBuffer);
-    // The log for this line has been removed to keep the console cleaner during operation.
-    // console.log(`[Whisper] WAV file written to temp: ${tempFilePath} (${wavBuffer.length} bytes)`);
 
     const fileStream = fs.createReadStream(tempFilePath);
     const start = Date.now();
@@ -131,27 +129,13 @@ async function transcribeWhisper(rawAudioBuffer) {
     const response = await openai.audio.transcriptions.create({
       file: fileStream,
       model: 'whisper-1',
-      language: 'en', // <-- ADD THIS LINE
+      language: 'en', // Forcing English transcription
     });
 
     const duration = ((Date.now() - start) / 1000).toFixed(2);
     console.log(`[Whisper] Transcription done in ${duration}s: "${response.text}"`);
 
     await fs.promises.unlink(tempFilePath);
-    // console.log('[Whisper] Temp WAV file deleted'); // Also commented out for cleaner logs.
-
-    return response.text;
-  } catch (error) {
-    console.error('[Whisper] Transcription error:', error);
-    throw error;
-  }
-}
-
-    const duration = ((Date.now() - start) / 1000).toFixed(2);
-    console.log(`[Whisper] Transcription done in ${duration}s: "${response.text}"`);
-
-    await fs.promises.unlink(tempFilePath);
-    console.log('[Whisper] Temp WAV file deleted');
 
     return response.text;
   } catch (error) {
@@ -180,14 +164,13 @@ async function speakText(text) {
     // Ensure byteOffset is aligned to 2 by creating a copy if needed
     const alignedBuffer = audioDataBuffer.byteOffset % 2 === 0
       ? audioDataBuffer
-      : Buffer.from(audioDataBuffer);  // This creates a new Buffer with byteOffset 0
+      : Buffer.from(audioDataBuffer);
     
     const int16Buffer = new Int16Array(
       alignedBuffer.buffer,
       alignedBuffer.byteOffset,
       alignedBuffer.byteLength / 2
     );
-
 
     return encodePCMToMuLaw(int16Buffer);
   } catch (error) {
@@ -202,7 +185,7 @@ wss.on('connection', (ws, req) => {
   let audioChunks = [];
   let isTranscribing = false;
   let intervalId = null;
-  let hasStartedReceivingMedia = false; // Tracks if we've logged the "RECEIVING AUDIO" message
+  let hasStartedReceivingMedia = false; 
 
   async function processPartialAudio() {
     if (isTranscribing) {
@@ -240,7 +223,6 @@ wss.on('connection', (ws, req) => {
       const ttsAudio = await speakText(reply);
       console.log(`[Process] TTS audio length: ${ttsAudio.length}`);
 
-      // Send TTS audio in 320-byte chunks with slight delay for smooth streaming
       for (let i = 0; i < ttsAudio.length; i += 320) {
         const chunk = ttsAudio.slice(i, i + 320);
         ws.send(
@@ -265,7 +247,6 @@ wss.on('connection', (ws, req) => {
     try {
       const msg = JSON.parse(message.toString());
       
-      // Only log events that are NOT 'media'
       if (msg.event !== 'media') {
         console.log('[WS] Received message event:', msg.event);
       }
@@ -273,11 +254,10 @@ wss.on('connection', (ws, req) => {
       if (msg.event === 'start') {
         console.log('[Call] Call started');
         audioChunks = [];
-        hasStartedReceivingMedia = false; // Reset for the new call
+        hasStartedReceivingMedia = false;
         if (intervalId) clearInterval(intervalId);
         intervalId = setInterval(processPartialAudio, 5000);
       } else if (msg.event === 'media') {
-        // Log the message only once when the first media packet arrives
         if (!hasStartedReceivingMedia) {
           console.log('[Call] RECEIVING AUDIO');
           hasStartedReceivingMedia = true;
@@ -294,7 +274,7 @@ wss.on('connection', (ws, req) => {
           console.log('[Call] Processing remaining audio on stop');
           await processPartialAudio();
         }
-        hasStartedReceivingMedia = false; // Reset on stop
+        hasStartedReceivingMedia = false; 
       } else {
         console.log('[WS] Unknown event:', msg.event);
       }

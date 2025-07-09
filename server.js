@@ -43,21 +43,25 @@ function encodePCMToMuLaw(pcmSamples) {
 }
 
 // --- Whisper Speech-to-Text helper ---
+import fs from 'fs';  // make sure you have fs imported
+
 async function transcribeWhisper(audioBuffer) {
   const tempFilePath = path.join(tmpdir(), `audio_${Date.now()}.wav`);
 
-  await fs.writeFile(tempFilePath, audioBuffer);
+  await fs.promises.writeFile(tempFilePath, audioBuffer);
   console.log(`[Whisper] Audio written to temp file: ${tempFilePath} (${audioBuffer.length} bytes)`);
+
+  const fileStream = fs.createReadStream(tempFilePath);
 
   const start = Date.now();
   const response = await openai.audio.transcriptions.create({
-    file: tempFilePath,
+    file: fileStream,
     model: 'whisper-1',
   });
   const duration = ((Date.now() - start) / 1000).toFixed(2);
   console.log(`[Whisper] Transcription completed in ${duration}s: "${response.text}"`);
 
-  await fs.unlink(tempFilePath);
+  await fs.promises.unlink(tempFilePath);
   console.log(`[Whisper] Temp file deleted`);
 
   return response.text;

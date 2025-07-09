@@ -5,6 +5,7 @@ import path from 'path';
 import { tmpdir } from 'os';
 import { OpenAI } from 'openai';
 import textToSpeech from '@google-cloud/text-to-speech';
+import { VAD } from '@ricky0123/vad-web';
 import dotenv from 'dotenv';
 dotenv.config();
 
@@ -56,14 +57,6 @@ function muLawToLinear(muLawByte) {
   return sign * sample;
 }
 
-function decodeMuLawTo16BitPCM(muLawBuffer) {
-  const pcmSamples = new Int16Array(muLawBuffer.length);
-  for (let i = 0; i < muLawBuffer.length; i++) {
-    pcmSamples[i] = muLawToLinear(muLawBuffer[i]);
-  }
-  return Buffer.from(pcmSamples.buffer);
-}
-
 function resample8kTo16k(inputSamples) {
   const outputLength = inputSamples.length * 2;
   const outputSamples = new Int16Array(outputLength);
@@ -75,12 +68,17 @@ function resample8kTo16k(inputSamples) {
   return outputSamples;
 }
 
-async function transcribeWhisper(muLawBuffer) {
+async function transcribeWhisper(pcmFloat32Buffer) {
   console.log('[Whisper] Starting transcription...');
   try {
-    const pcm8kBuffer = decodeMuLawTo16BitPCM(muLawBuffer);
-    const pcm8kSamples = new Int16Array(pcm8kBuffer.buffer, pcm8kBuffer.byteOffset, pcm8kBuffer.length / 2);
-    const pcm16kSamples = resample8kTo16k(pcm8kSamples);
+    // Convert 8kHz Float32 to 8kHz Int16
+    const pcm8kInt16 = new Int16Array(pcmFloat32Buffer.length);
+    for (let i = 0; i < pcmFloat32Buffer.length; i++) {
+        pcm8kInt16[i] = pcmFloat32Buffer[i] * 32767;
+    }
+
+    // Resample 8kHz Int16 to 16kHz Int16
+    const pcm16kSamples = resample8kTo16k(pcm8kInt16);
     const pcm16kBuffer = Buffer.from(pcm16kSamples.buffer);
     const wavHeader = createWavHeader(pcm16kBuffer.length);
     const fileName = `audio_${Date.now()}.wav`;
@@ -131,73 +129,76 @@ async function speakText(text, ws) {
 wss.on('connection', async (ws, req) => {
   console.log('[WS] New connection established.');
   
-  const SILENCE_THRESHOLD_MS = 800; // Wait 0.8s for user to stop talking
-  const MIN_UTTERANCE_BYTES = 8000; // Minimum audio length (~0.5s)
+  try {
+    const vad = await VAD.create({
+        sampleRate: 8000,
+        threshold: 0.7, // Increased threshold to ignore background noise
+        minSpeechFrames: 5,
+        maxSpeechFrames: 250,
+        minSilenceFrames: 15,
+        onSpeechStart: () => {
+            console.log('[VAD] Speech started.');
+        },
+        onSpeechEnd: async (audio) => {
+            console.log(`[VAD] Speech ended. Processing ${audio.length} audio frames.`);
+            try {
+                const transcript = await transcribeWhisper(audio);
+                if (transcript && transcript.trim().length > 1) {
+                    console.log(`[Process] Transcript: "${transcript}"`);
+                    const chatCompletion = await openai.chat.completions.create({
+                        model: 'gpt-4o-mini',
+                        messages: [{ role: 'user', content: transcript }],
+                    });
+                    const reply = chatCompletion.choices[0].message.content;
+                    console.log(`[Process] GPT reply: "${reply}"`);
+                    await speakText(reply, ws);
+                } else {
+                    console.log('[Process] Transcript empty, ignoring.');
+                }
+            } catch (error) {
+                console.error('[Process] Error during VAD data processing:', error);
+            }
+        },
+    });
 
-  let audioChunks = [];
-  let silenceTimeout = null;
-  let isTranscribing = false;
-
-  const processUtterance = async () => {
-    if (isTranscribing) return;
-    if (audioChunks.length === 0) return;
-
-    const completeAudio = Buffer.concat(audioChunks);
-    audioChunks = []; // Clear buffer immediately
-
-    if (completeAudio.length < MIN_UTTERANCE_BYTES) {
-        console.log(`[Process] Utterance too short (${completeAudio.length} bytes), ignoring.`);
-        return;
-    }
-    
-    isTranscribing = true;
-    try {
-        console.log(`[Process] Processing utterance of ${completeAudio.length} bytes.`);
-        const transcript = await transcribeWhisper(completeAudio);
-        if (transcript && transcript.trim().length > 1) {
-            console.log(`[Process] Transcript: "${transcript}"`);
-            const chatCompletion = await openai.chat.completions.create({
-                model: 'gpt-4o-mini',
-                messages: [{ role: 'user', content: transcript }],
-            });
-            const reply = chatCompletion.choices[0].message.content;
-            console.log(`[Process] GPT reply: "${reply}"`);
-            await speakText(reply, ws);
-        } else {
-            console.log('[Process] Transcript empty, ignoring.');
+    ws.on('message', (message) => {
+      try {
+        const msg = JSON.parse(message.toString());
+        if (msg.event === 'media') {
+          const muLawChunk = Buffer.from(msg.media.payload, 'base64');
+          // VAD needs Float32Array audio data.
+          const pcm16k = new Int16Array(muLawChunk.length);
+          for (let i = 0; i < muLawChunk.length; i++) {
+              pcm16k[i] = muLawToLinear(muLawChunk[i]);
+          }
+          const pcm32f = new Float32Array(pcm16k.length);
+          for (let i = 0; i < pcm16k.length; i++) {
+              pcm32f[i] = pcm16k[i] / 32768;
+          }
+          vad.process(pcm32f);
+        } else if (msg.event === 'start') {
+          console.log('[Call] Call started.');
+        } else if (msg.event === 'stop') {
+          console.log('[Call] Call stopped.');
+          vad.destroy();
         }
-    } catch (error) {
-        console.error('[Process] Error during utterance processing:', error);
-    } finally {
-        isTranscribing = false;
-    }
-  };
-
-  const startSilenceTimeout = () => {
-    if (silenceTimeout) clearTimeout(silenceTimeout);
-    silenceTimeout = setTimeout(processUtterance, SILENCE_THRESHOLD_MS);
-  };
-
-  ws.on('message', (message) => {
-    try {
-      const msg = JSON.parse(message.toString());
-      if (msg.event === 'media') {
-        audioChunks.push(Buffer.from(msg.media.payload, 'base64'));
-        startSilenceTimeout();
-      } else if (msg.event === 'start') {
-        console.log('[Call] Started.');
-      } else if (msg.event === 'stop') {
-        console.log('[Call] Stopped.');
-        if (silenceTimeout) clearTimeout(silenceTimeout);
-        processUtterance(); // Process any remaining audio
+      } catch (error) {
+        console.error('[WS] Error handling message:', error);
       }
-    } catch (error) {
-      console.error('[WS] Error handling message:', error);
-    }
-  });
+    });
 
-  ws.on('close', () => console.log('[WS] Connection closed.'));
-  ws.on('error', (err) => console.error('[WS] Connection error:', err));
+    ws.on('close', () => {
+        console.log('[WS] Connection closed.');
+        if (vad) vad.destroy();
+    });
+    ws.on('error', (err) => {
+        console.error('[WS] Connection error:', err);
+        if (vad) vad.destroy();
+    });
+
+  } catch (e) {
+      console.error('[VAD] Failed to create VAD', e)
+  }
 });
 
 const server = app.listen(process.env.PORT || 3000, () => {

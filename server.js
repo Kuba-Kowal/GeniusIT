@@ -162,16 +162,17 @@ async function speakText(text) {
 
     console.log(`[TTS] Audio synthesized: ${audioDataBuffer.length} bytes`);
 
-    // Align buffer if needed
+    // Ensure byteOffset is aligned to 2 by creating a copy if needed
     const alignedBuffer = audioDataBuffer.byteOffset % 2 === 0
       ? audioDataBuffer
-      : audioDataBuffer.slice();
-
+      : Buffer.from(audioDataBuffer);  // This creates a new Buffer with byteOffset 0
+    
     const int16Buffer = new Int16Array(
       alignedBuffer.buffer,
       alignedBuffer.byteOffset,
       alignedBuffer.byteLength / 2
     );
+
 
     return encodePCMToMuLaw(int16Buffer);
   } catch (error) {

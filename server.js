@@ -5,7 +5,7 @@ import fs from "fs";
 import path from "path";
 import { pipeline } from "stream";
 import { spawn } from "child_process";
-import OpenAIApi from "openai";
+import OpenAI from "openai";
 import textToSpeech from "@google-cloud/text-to-speech";
 import { v4 as uuidv4 } from "uuid";
 

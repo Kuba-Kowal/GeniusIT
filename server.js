@@ -1,35 +1,34 @@
-// server.js
-
 import express from 'express';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { Readable } from 'stream';
 import { tmpdir } from 'os';
-import sdk from 'api';
-import { exec } from 'child_process';
 import util from 'util';
 import ffmpeg from 'fluent-ffmpeg';
 
 import textToSpeech from '@google-cloud/text-to-speech';
+import OpenAI from 'openai';
 
-const execPromise = util.promisify(exec);
+const execPromise = util.promisify(fs.promises.writeFile);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
 const app = express();
 const httpServer = createServer(app);
-const io = new Server(httpServer);
+const io = new Server(httpServer, { cors: { origin: '*' } });
 
 const PORT = process.env.PORT || 10000;
+
 httpServer.listen(PORT, () => {
   console.log(`✅ Server listening on port ${PORT}`);
 });
 
 // OpenAI setup
-import OpenAI from 'openai';
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
 
 // Google Cloud TTS setup
 const ttsClient = new textToSpeech.TextToSpeechClient();
@@ -38,131 +37,151 @@ function base64ToBuffer(base64String) {
   return Buffer.from(base64String, 'base64');
 }
 
-function pcmToWav(pcmData, sampleRate = 8000, numChannels = 1, bitDepth = 16) {
+// Converts raw PCM audio buffer (s16le) to WAV buffer using ffmpeg
+function pcmToWav(pcmBuffer, sampleRate = 8000) {
   return new Promise((resolve, reject) => {
-    const tempPCM = path.join(tmpdir(), `temp_${Date.now()}.raw`);
-    const tempWAV = path.join(tmpdir(), `temp_${Date.now()}.wav`);
-    fs.writeFileSync(tempPCM, pcmData);
+    const tmpPCMPath = path.join(tmpdir(), `pcm_${Date.now()}.raw`);
+    const tmpWavPath = path.join(tmpdir(), `wav_${Date.now()}.wav`);
 
-    ffmpeg(tempPCM)
+    fs.writeFileSync(tmpPCMPath, pcmBuffer);
+
+    ffmpeg(tmpPCMPath)
       .inputFormat('s16le')
       .audioFrequency(sampleRate)
-      .audioChannels(numChannels)
+      .audioChannels(1)
       .audioCodec('pcm_s16le')
       .format('wav')
       .on('end', () => {
-        const wavBuffer = fs.readFileSync(tempWAV);
-        fs.unlinkSync(tempPCM);
-        fs.unlinkSync(tempWAV);
+        const wavBuffer = fs.readFileSync(tmpWavPath);
+        // Clean up temp files
+        fs.unlinkSync(tmpPCMPath);
+        fs.unlinkSync(tmpWavPath);
         resolve(wavBuffer);
       })
-      .on('error', err => {
-        console.error('[FFmpeg Error]', err);
+      .on('error', (err) => {
+        console.error('[FFmpeg] Error converting PCM to WAV:', err);
         reject(err);
       })
-      .save(tempWAV);
+      .save(tmpWavPath);
   });
 }
 
-async function transcribeWhisper(audioBuffer) {
+// Transcribe audio using OpenAI Whisper
+async function transcribeAudio(pcmBuffer) {
   try {
-    if (!audioBuffer || audioBuffer.length < 1024) {
-      console.warn('[Whisper] Skipping transcription: audio too short');
+    if (!pcmBuffer || pcmBuffer.length < 1500) {
+      console.warn('[Whisper] Audio too short, skipping transcription');
       return '';
     }
+    const wavBuffer = await pcmToWav(pcmBuffer);
 
-    const wavBuffer = await pcmToWav(audioBuffer);
-    const tempPath = path.join(tmpdir(), `audio_${Date.now()}.wav`);
-    fs.writeFileSync(tempPath, wavBuffer);
-    console.log(`[Whisper] WAV file written to: ${tempPath}`);
+    const tempWavPath = path.join(tmpdir(), `whisper_${Date.now()}.wav`);
+    fs.writeFileSync(tempWavPath, wavBuffer);
 
+    console.log('[Whisper] Sending audio for transcription...');
     const transcription = await openai.audio.transcriptions.create({
-      file: fs.createReadStream(tempPath),
+      file: fs.createReadStream(tempWavPath),
       model: 'whisper-1',
     });
 
+    fs.unlinkSync(tempWavPath);
+
     console.log(`[Whisper] Transcription result: ${transcription.text}`);
     return transcription.text;
-  } catch (err) {
-    console.error('[Whisper ERROR]', err);
+  } catch (error) {
+    console.error('[Whisper] Transcription error:', error);
     return '';
   }
 }
 
-async function getChatGPTResponse(prompt) {
-  const chat = await openai.chat.completions.create({
-    model: 'gpt-4o-mini',
-    messages: [{ role: 'user', content: prompt }],
-  });
-  const response = chat.choices[0].message.content;
-  console.log(`[ChatGPT] Response: ${response}`);
-  return response;
+// Get ChatGPT response
+async function getChatResponse(prompt) {
+  try {
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: prompt }],
+    });
+    const reply = completion.choices[0].message.content;
+    console.log('[ChatGPT] Response:', reply);
+    return reply;
+  } catch (err) {
+    console.error('[ChatGPT] Error:', err);
+    return 'Sorry, something went wrong.';
+  }
 }
 
-async function synthesizeTTS(text) {
+// Synthesize speech from text with Google Cloud TTS
+async function synthesizeSpeech(text) {
   try {
     const [response] = await ttsClient.synthesizeSpeech({
       input: { text },
       voice: { languageCode: 'en-US', ssmlGender: 'NEUTRAL' },
       audioConfig: { audioEncoding: 'MP3' },
     });
-    const audioBuffer = response.audioContent;
-    console.log(`[TTS] Audio synthesized (${audioBuffer.length} bytes)`);
-    return audioBuffer;
+
+    const audioContent = response.audioContent;
+    console.log(`[TTS] Synthesized ${audioContent.length} bytes of audio.`);
+    return audioContent;
   } catch (err) {
-    console.error('[TTS ERROR]', err);
+    console.error('[TTS] Error:', err);
     return null;
   }
 }
 
-// Socket logic
+// Socket.IO connection handling
 io.on('connection', (socket) => {
-  console.log('[Socket] Client connected');
+  console.log('[Socket.IO] Client connected:', socket.id);
+
   let audioChunks = [];
   let isProcessing = false;
 
   socket.on('media', async (data) => {
     if (!data?.audio) return;
-
     try {
-      const audioData = base64ToBuffer(data.audio);
-      console.log(`[Audio] Received chunk (${audioData.length} bytes)`);
-      audioChunks.push(audioData);
+      const audioChunk = base64ToBuffer(data.audio);
+      audioChunks.push(audioChunk);
 
+      // Process every ~5 chunks (you can adjust this count)
       if (audioChunks.length >= 5 && !isProcessing) {
         isProcessing = true;
-        const pcmAudio = Buffer.concat(audioChunks);
+        const combinedPCM = Buffer.concat(audioChunks);
         audioChunks = [];
 
-        const transcript = await transcribeWhisper(pcmAudio);
+        console.log(`[Audio] Processing ${combinedPCM.length} bytes of PCM audio`);
+
+        const transcript = await transcribeAudio(combinedPCM);
         if (!transcript || transcript.trim() === '') {
+          console.log('[Whisper] No transcription received, skipping.');
           isProcessing = false;
           return;
         }
 
         socket.emit('partial-transcript', { text: transcript });
 
-        const response = await getChatGPTResponse(transcript);
-        const ttsAudio = await synthesizeTTS(response);
+        const chatResponse = await getChatResponse(transcript);
 
-        if (ttsAudio && ttsAudio.length > 0) {
-          socket.emit('media-response', { audio: ttsAudio.toString('base64') });
+        const ttsAudioBuffer = await synthesizeSpeech(chatResponse);
+
+        if (ttsAudioBuffer) {
+          socket.emit('media-response', {
+            audio: Buffer.from(ttsAudioBuffer).toString('base64'),
+          });
         }
 
         isProcessing = false;
       }
-    } catch (err) {
-      console.error('[Media Error]', err);
+    } catch (error) {
+      console.error('[Socket] Error processing media:', error);
       isProcessing = false;
     }
   });
 
   socket.on('disconnect', () => {
-    console.log('[Socket] Client disconnected');
+    console.log('[Socket.IO] Client disconnected:', socket.id);
   });
 });
 
-// Health check
+// Health check endpoint
 app.get('/', (req, res) => {
   res.send('Twilio AI Voice Server is running.');
 });

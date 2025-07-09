@@ -1,7 +1,7 @@
 // server.js (Complete version with integrated mu-law encoder, Whisper STT, Google TTS, and Twilio WebSocket support)
 
 import express from 'express';
-import WebSocket from 'ws';
+import { WebSocketServer } from 'ws';
 import fs from 'fs';
 import { Readable } from 'stream';
 import { OpenAI } from 'openai';
@@ -10,7 +10,7 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 const app = express();
-const wss = new WebSocket.Server({ noServer: true });
+const wss = new WebSocketServer({ noServer: true });
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const ttsClient = new textToSpeech.TextToSpeechClient();

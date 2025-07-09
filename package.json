@@ -19,7 +19,7 @@
     "wave-resampler": "^1.0.0",
     "dotenv": "^16.0.3",
     "ws": "^8.18.3",
-    "@ricky0123/vad-node": "^0.0.3"
+    "node-vad": "^1.1.2"
   },
   "onnxruntime-node": {
     "provider": "cpu"

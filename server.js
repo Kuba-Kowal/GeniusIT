@@ -5,6 +5,7 @@ import path from 'path';
 import { tmpdir } from 'os';
 import { OpenAI } from 'openai';
 import textToSpeech from '@google-cloud/text-to-speech';
+import { VAD } from '@ricky0123/vad-node';
 import dotenv from 'dotenv';
 dotenv.config();
 
@@ -109,7 +110,6 @@ function resample8kTo16k(inputSamples) {
   return outputSamples;
 }
 
-
 async function transcribeWhisper(rawAudioBuffer) {
   console.log('[Whisper] Starting transcription');
 
@@ -128,12 +128,10 @@ async function transcribeWhisper(rawAudioBuffer) {
     const tempFilePath = path.join(tempDir, fileName);
     const wavBuffer = Buffer.concat([wavHeader, pcm16kBuffer]);
 
-    await fs.promises.writeFile(tempFilePath, wavBuffer);
+  tfs.promises.writeFile(tempFilePath, wavBuffer);
     
-    // --- DEBUGGING: Log the public URL of the WAV file ---
     const publicUrl = `https://${process.env.RENDER_EXTERNAL_HOSTNAME}/downloads/${fileName}`;
     console.log(`[Whisper] WAV file available for download at: ${publicUrl}`);
-    // ---------------------------------------------------
 
     const fileStream = fs.createReadStream(tempFilePath);
     const start = Date.now();
@@ -146,9 +144,6 @@ async function transcribeWhisper(rawAudioBuffer) {
 
     const duration = ((Date.now() - start) / 1000).toFixed(2);
     console.log(`[Whisper] Transcription done in ${duration}s: "${response.text}"`);
-
-    // The line to delete the file is removed for debugging.
-    // await fs.promises.unlink(tempFilePath);
 
     return response.text;
   } catch (error) {
@@ -191,121 +186,99 @@ async function speakText(text) {
   }
 }
 
-wss.on('connection', (ws, req) => {
+wss.on('connection', async (ws, req) => {
   console.log('[WS] New connection from:', req.socket.remoteAddress);
+  let isTranscribing = false;
 
-  let audioChunks = [];
-  let isTranscribing = false;
-  let intervalId = null;
-  let hasStartedReceivingMedia = false; 
-
-  async function processPartialAudio() {
-    if (isTranscribing) {
-      console.log('[Process] Still transcribing, skipping this interval');
-      return;
-    }
-    if (audioChunks.length === 0) {
-      console.log('[Process] No audio chunks to process');
-      return;
-    }
-
-    isTranscribing = true;
-    try {
-      const audioBuffer = Buffer.concat(audioChunks);
-      console.log(`[Process] Processing audio buffer length: ${audioBuffer.length}`);
-
-      const transcript = await transcribeWhisper(audioBuffer);
-      console.log(`[Process] Transcript: "${transcript}"`);
-
-      if (!transcript || transcript.trim() === '') {
-        console.log('[Process] Empty transcript, skipping TTS');
-        audioChunks = [];
-        isTranscribing = false;
-        return;
-      }
-
-      const chatCompletion = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
-        messages: [{ role: 'user', content: transcript }],
-      });
-
-      const reply = chatCompletion.choices[0].message.content;
-      console.log(`[Process] GPT reply: "${reply}"`);
-
-      const ttsAudio = await speakText(reply);
-      console.log(`[Process] TTS audio length: ${ttsAudio.length}`);
-
-      for (let i = 0; i < ttsAudio.length; i += 320) {
-        const chunk = ttsAudio.slice(i, i + 320);
-        ws.send(
-          JSON.stringify({
-            event: 'media',
-            media: { payload: chunk.toString('base64') },
-          })
-        );
-        await new Promise(r => setTimeout(r, 20));
-      }
-      console.log('[Process] Sent TTS audio chunks');
-
-      audioChunks = [];
-    } catch (error) {
-      console.error('[Process] Error processing audio:', error);
-    } finally {
-      isTranscribing = false;
-    }
-  }
-
-  ws.on('message', async (message) => {
-    try {
-      const msg = JSON.parse(message.toString());
+  const vad = new VAD({
+    sampleRate: 8000, // Twilio media stream is 8kHz
+    onSpeechStart: () => {
+      console.log("[VAD] Speech started");
+    },
+    onSpeechEnd: async (audio) => {
+      console.log(`[VAD] Speech ended. Processing ${audio.length} bytes.`);
       
-      if (msg.event !== 'media') {
-        console.log('[WS] Received message event:', msg.event);
-      }
+      if (isTranscribing) {
+        console.log('[Process] Already transcribing, skipping this audio segment.');
+        return;
+      }
 
-      if (msg.event === 'start') {
-        console.log('[Call] Call started');
-        audioChunks = [];
-        hasStartedReceivingMedia = false;
-        if (intervalId) clearInterval(intervalId);
-        intervalId = setInterval(processPartialAudio, 5000);
-      } else if (msg.event === 'media') {
-        if (!hasStartedReceivingMedia) {
-          console.log('[Call] RECEIVING AUDIO');
-          hasStartedReceivingMedia = true;
-        }
-        const payload = Buffer.from(msg.media.payload, 'base64');
-        audioChunks.push(payload);
-      } else if (msg.event === 'stop') {
-        console.log('[Call] Call stopped');
-        if (intervalId) {
-          clearInterval(intervalId);
-          intervalId = null;
-        }
-        if (audioChunks.length > 0) {
-          console.log('[Call] Processing remaining audio on stop');
-          await processPartialAudio();
-        }
-        hasStartedReceivingMedia = false; 
-      } else {
-        console.log('[WS] Unknown event:', msg.event);
-      }
-    } catch (error) {
-      console.error('[WS] Error handling message:', error);
-    }
-  });
+      isTranscribing = true;
+      try {
+        const audioBuffer = Buffer.from(audio);
+        const transcript = await transcribeWhisper(audioBuffer);
+        console.log(`[Process] Transcript: "${transcript}"`);
 
-  ws.on('close', () => {
-    console.log('[WS] Connection closed by client');
-    if (intervalId) {
-      clearInterval(intervalId);
-      intervalId = null;
-    }
-  });
+        if (!transcript || transcript.trim().length < 2) {
+          console.log('[Process] Empty or too short transcript, skipping TTS.');
+          return;
+        }
 
-  ws.on('error', (err) => {
-    console.error('[WS] Connection error:', err);
-  });
+        const chatCompletion = await openai.chat.completions.create({
+          model: 'gpt-4o-mini',
+          messages: [{ role: 'user', content: transcript }],
+        });
+
+        const reply = chatCompletion.choices[0].message.content;
+        console.log(`[Process] GPT reply: "${reply}"`);
+
+        const ttsAudio = await speakText(reply);
+        console.log(`[Process] TTS audio length: ${ttsAudio.length}`);
+
+        for (let i = 0; i < ttsAudio.length; i += 320) {
+          const chunk = ttsAudio.slice(i, i + 320);
+          if (ws.readyState === 1) { // Check if WebSocket is still open
+            ws.send(JSON.stringify({
+              event: 'media',
+              media: { payload: chunk.toString('base64') },
+            }));
+          }
+          await new Promise(r => setTimeout(r, 20));
+        }
+        console.log('[Process] Sent TTS audio chunks');
+
+      } catch (error) {
+        console.error('[Process] Error processing audio:', error);
+      } finally {
+        isTranscribing = false;
+      }
+    },
+  });
+
+  ws.on('message', async (message) => {
+    try {
+      const msg = JSON.parse(message.toString());
+      
+      switch (msg.event) {
+        case 'start':
+          console.log('[Call] Call started');
+          break;
+        case 'media':
+          const payload = Buffer.from(msg.media.payload, 'base64');
+          vad.process(payload); // Feed audio into VAD
+          break;
+        case 'stop':
+          console.log('[Call] Call stopped');
+          vad.destroy();
+          break;
+        default:
+          console.log('[WS] Unknown event:', msg.event);
+          break;
+      }
+    } catch (error) {
+      console.error('[WS] Error handling message:', error);
+    }
+  });
+
+  ws.on('close', () => {
+    console.log('[WS] Connection closed by client');
+    vad.destroy();
+  });
+
+  ws.on('error', (err) => {
+    console.error('[WS] Connection error:', err);
+    vad.destroy();
+  });
 });
 
 const server = app.listen(process.env.PORT || 3000, () => {

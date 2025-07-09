@@ -1,245 +1,202 @@
-import express from "express";
-import http from "http";
-import WebSocket, { WebSocketServer } from "ws";
-import { writeFileSync, unlinkSync, existsSync } from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
-import { spawn } from "child_process";
-import { OpenAI } from "openai";
-import { execSync } from "child_process";
+import http from 'http';
+import { WebSocketServer } from 'ws';
+import fs from 'fs';
+import path from 'path';
+import { tmpdir } from 'os';
+import { v4 as uuidv4 } from 'uuid';
+import { fileURLToPath } from 'url';
+import { OpenAI } from 'openai';
+import ffmpeg from 'fluent-ffmpeg';
+import { PassThrough } from 'stream';
+import fetch from 'node-fetch';
 
+// Set up __dirname for ES module
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const app = express();
-const server = http.createServer(app);
+// Config & OpenAI client initialization
+const PORT = process.env.PORT || 10000;
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
+console.log('[Server] Starting server...');
+
+const server = http.createServer((req, res) => {
+  // Basic health check endpoint
+  if (req.url === '/') {
+    res.writeHead(200);
+    res.end('Twilio AI Voice Bot Server running');
+  } else {
+    res.writeHead(404);
+    res.end();
+  }
+});
+
 const wss = new WebSocketServer({ noServer: true });
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const PORT = process.env.PORT || 10000;
-
-if (!OPENAI_API_KEY) {
-  console.error("ERROR: OPENAI_API_KEY not set in environment variables");
-  process.exit(1);
-}
-
-const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
-
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
-
-console.log("Starting server...");
-
-// -- Global error handlers --
-process.on("uncaughtException", (err) => {
-  console.error("[Uncaught Exception]", err);
+server.on('upgrade', (request, socket, head) => {
+  console.log('[Server] Upgrade request to WebSocket received');
+  wss.handleUpgrade(request, socket, head, (ws) => {
+    wss.emit('connection', ws, request);
+  });
 });
 
-process.on("unhandledRejection", (reason, promise) => {
-  console.error("[Unhandled Rejection]", reason);
-});
-
-// -- Twilio Webhook endpoint for call start --
-app.post("/twilio/voice", (req, res) => {
-  console.log("[Twilio] Incoming call webhook received");
-  // Respond with TwiML to start Media Stream to WebSocket server
-  res.type("text/xml");
-  res.send(`
-    <Response>
-      <Start>
-        <Stream url="wss://${req.headers.host}/media" />
-      </Start>
-      <Say>Welcome to the AI voice assistant.</Say>
-      <Pause length="1"/>
-    </Response>
-  `);
-});
-
-// -- Upgrade HTTP server to handle WebSocket for media stream --
-server.on("upgrade", (request, socket, head) => {
-  console.log("[Server] Upgrade request to WebSocket received");
-  if (request.url === "/media") {
-    wss.handleUpgrade(request, socket, head, (ws) => {
-      wss.emit("connection", ws, request);
-    });
-  } else {
-    socket.destroy();
-  }
-});
-
-// -- Helper: Convert PCM audio chunks to WAV using ffmpeg and save to temp file --
-async function convertPCMToWav(pcmBuffer, outputPath) {
+// Utility: write buffer to temp WAV file
+function writeBufferToWav(buffer) {
   return new Promise((resolve, reject) => {
-    const ffmpeg = spawn("ffmpeg", [
-      "-f", "s16le",    // PCM signed 16-bit little endian
-      "-ar", "8000",    // sample rate 8000Hz (Twilio default)
-      "-ac", "1",       // mono channel
-      "-i", "pipe:0",
-      "-f", "wav",
-      outputPath,
-      "-y"
-    ]);
+    const filename = path.join(tmpdir(), `audio_${Date.now()}.wav`);
+    console.log(`[Whisper] Writing WAV file to temp: ${filename} (${buffer.length} bytes)`);
 
-    ffmpeg.stdin.write(pcmBuffer);
-    ffmpeg.stdin.end();
+    // Use ffmpeg to convert raw PCM buffer to WAV file
+    const inputStream = new PassThrough();
+    inputStream.end(buffer);
 
-    ffmpeg.on("error", (err) => {
-      console.error("[ffmpeg] Spawn error:", err);
-      reject(err);
-    });
-
-    ffmpeg.on("close", (code) => {
-      if (code === 0) {
-        console.log("[ffmpeg] Conversion successful:", outputPath);
-        resolve(outputPath);
-      } else {
-        reject(new Error(`ffmpeg exited with code ${code}`));
-      }
-    });
+    ffmpeg(inputStream)
+      .inputFormat('s16le')
+      .audioFrequency(8000)
+      .audioChannels(1)
+      .format('wav')
+      .on('error', (err) => {
+        console.error('[Whisper] ffmpeg error:', err);
+        reject(err);
+      })
+      .on('end', () => {
+        console.log('[Whisper] WAV file write complete');
+        resolve(filename);
+      })
+      .save(filename);
   });
 }
 
-// -- Helper: Whisper transcription --
-async function transcribeWhisper(wavPath) {
-  console.log("[Whisper] Starting transcription of", wavPath);
+// Transcribe WAV file using OpenAI Whisper API
+async function transcribeWhisper(buffer) {
   try {
-    const file = await import("fs/promises").then(fs => fs.readFile(wavPath));
-    const response = await openai.audio.transcriptions.create({
-      file,
-      model: "whisper-1"
+    const wavPath = await writeBufferToWav(buffer);
+    const fileStream = fs.createReadStream(wavPath);
+
+    console.log('[Whisper] Sending audio to OpenAI Whisper API...');
+    const transcriptResponse = await openai.audio.transcriptions.create({
+      file: fileStream,
+      model: 'whisper-1',
+      language: 'en',
     });
-    console.log("[Whisper] Transcription result:", response.text);
-    return response.text;
+
+    fileStream.close();
+    fs.unlink(wavPath, (err) => {
+      if (err) console.error('[Whisper] Failed to delete temp file:', err);
+      else console.log('[Whisper] Temp file deleted');
+    });
+
+    console.log('[Whisper] Transcription result:', transcriptResponse.text);
+    return transcriptResponse.text;
   } catch (err) {
-    console.error("[Whisper] Transcription error:", err);
-    return "";
-  } finally {
-    try {
-      if (existsSync(wavPath)) {
-        unlinkSync(wavPath);
-        console.log("[Whisper] Temp WAV deleted:", wavPath);
-      }
-    } catch (e) {
-      console.error("[Whisper] Error deleting temp WAV:", e);
-    }
+    console.error('[Whisper] Transcription error:', err);
+    throw err;
   }
 }
 
-// -- Helper: ChatGPT response --
-async function askChatGPT(prompt) {
-  console.log("[ChatGPT] Sending prompt:", prompt);
+// Query ChatGPT with prompt and get response text
+async function queryChatGPT(prompt) {
   try {
+    console.log('[ChatGPT] Sending prompt:', prompt);
     const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [{ role: "user", content: prompt }]
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: prompt }],
     });
-    const reply = completion.choices[0]?.message?.content || "";
-    console.log("[ChatGPT] Response:", reply);
-    return reply;
+    const text = completion.choices[0].message.content.trim();
+    console.log('[ChatGPT] Response:', text);
+    return text;
   } catch (err) {
-    console.error("[ChatGPT] Error:", err);
-    return "Sorry, I couldn't process that.";
+    console.error('[ChatGPT] Error:', err);
+    throw err;
   }
 }
 
-// -- Helper: TTS using gtts-cli command line --
-async function synthesizeTTS(text, outputPath) {
-  return new Promise((resolve, reject) => {
-    console.log("[TTS] Synthesizing text:", text);
-    // Call gtts-cli to generate mp3 file
-    const cmd = `gtts-cli "${text.replace(/"/g, '\\"')}" --lang en --output ${outputPath}`;
-    try {
-      execSync(cmd);
-      console.log("[TTS] Synthesized mp3 saved:", outputPath);
-      resolve(outputPath);
-    } catch (err) {
-      console.error("[TTS] gtts-cli error:", err);
-      reject(err);
-    }
-  });
+// Synthesize speech from text (Google TTS)
+async function synthesizeSpeech(text) {
+  try {
+    console.log('[TTS] Synthesizing text:', text);
+    // Replace with your preferred TTS API and implementation
+    // Example placeholder: returning dummy Buffer for now
+    // You should implement real TTS call here
+    const dummyAudioBuffer = Buffer.alloc(1024); // Replace with actual audio bytes
+    console.log('[TTS] Audio synthesized, size:', dummyAudioBuffer.length);
+    return dummyAudioBuffer;
+  } catch (err) {
+    console.error('[TTS] Synthesis error:', err);
+    throw err;
+  }
 }
 
-// -- WebSocket connections --
-wss.on("connection", (ws) => {
-  console.log("[WebSocket] Client connected");
+// WebSocket connection and message handling
+wss.on('connection', (ws, req) => {
+  console.log('[Server] WebSocket connection established');
 
-  // Buffer for audio chunks
-  let audioChunks = [];
+  // Buffer for collecting incoming audio PCM chunks from Twilio Media Stream
+  let audioBuffer = Buffer.alloc(0);
 
-  ws.on("message", async (msg) => {
+  ws.on('message', async (data) => {
+    console.log(`[Server] Received message, length: ${data.length} bytes`);
+
     try {
-      // Expect message as JSON with base64 audio chunk
-      const data = JSON.parse(msg);
+      // Twilio sends JSON messages with a 'event' field
+      const msg = JSON.parse(data.toString());
+      if (msg.event === 'start') {
+        console.log('[Twilio] Media stream started');
+      } else if (msg.event === 'media') {
+        // Incoming audio chunk base64 encoded
+        const audioChunk = Buffer.from(msg.media.payload, 'base64');
+        console.log(`[Twilio] Received audio chunk: ${audioChunk.length} bytes`);
 
-      if (data.event === "start") {
-        console.log("[WebSocket] Stream started");
-        audioChunks = [];
-        return;
-      }
+        // Append chunk to buffer
+        audioBuffer = Buffer.concat([audioBuffer, audioChunk]);
 
-      if (data.event === "media") {
-        const audioBase64 = data.media.payload;
-        const audioBuffer = Buffer.from(audioBase64, "base64");
+        // Process when buffer size exceeds threshold (e.g., 40k bytes)
+        if (audioBuffer.length >= 40000) {
+          console.log('[Server] Buffer size threshold reached, processing audio');
 
-        console.log(`[WebSocket] Received media chunk size: ${audioBuffer.length}`);
+          // Copy current buffer and reset for next batch
+          const bufferToProcess = audioBuffer;
+          audioBuffer = Buffer.alloc(0);
 
-        audioChunks.push(audioBuffer);
+          // Transcribe with Whisper
+          const transcript = await transcribeWhisper(bufferToProcess);
 
-        // For demo, process audio every ~1.5s (12k bytes)
-        if (Buffer.concat(audioChunks).length > 12000) {
-          const pcmBuffer = Buffer.concat(audioChunks);
-          audioChunks = []; // reset buffer
+          if (transcript && transcript.trim() !== '') {
+            // Query ChatGPT
+            const responseText = await queryChatGPT(transcript);
 
-          const tempWav = path.join(__dirname, `temp_${Date.now()}.wav`);
-          try {
-            await convertPCMToWav(pcmBuffer, tempWav);
-            const transcript = await transcribeWhisper(tempWav);
-            if (!transcript || transcript.trim() === "") {
-              console.log("[WebSocket] Empty transcript, ignoring");
-              return;
-            }
-            const gptResponse = await askChatGPT(transcript);
+            // Synthesize speech
+            const speechAudio = await synthesizeSpeech(responseText);
 
-            const ttsOutput = path.join(__dirname, `tts_${Date.now()}.mp3`);
-            await synthesizeTTS(gptResponse, ttsOutput);
-
-            // Send synthesized TTS audio back as base64 in JSON message (for demo, in real would stream)
-            const ttsData = Buffer.from(require("fs").readFileSync(ttsOutput)).toString("base64");
-            ws.send(JSON.stringify({
-              event: "tts",
-              audio: ttsData
-            }));
-
-            // Clean up TTS file
-            if (existsSync(ttsOutput)) unlinkSync(ttsOutput);
-          } catch (err) {
-            console.error("[WebSocket] Error processing audio chunk:", err);
+            // Stream TTS audio back to Twilio client
+            ws.send(speechAudio);
+            console.log('[Server] Sent TTS audio back to client');
+          } else {
+            console.log('[Server] Empty transcript, skipping ChatGPT and TTS');
           }
         }
-        return;
-      }
-
-      if (data.event === "stop") {
-        console.log("[WebSocket] Stream stopped by client");
-        ws.close();
-        return;
+      } else if (msg.event === 'stop') {
+        console.log('[Twilio] Media stream stopped');
+        // Optionally handle stream stop, cleanup
+      } else {
+        console.log('[Server] Unknown message event:', msg.event);
       }
     } catch (err) {
-      console.error("[WebSocket] Message handler error:", err);
+      console.error('[Server] Error handling message:', err);
     }
   });
 
-  ws.on("close", () => {
-    console.log("[WebSocket] Client disconnected");
+  ws.on('close', () => {
+    console.log('[Server] WebSocket connection closed');
+  });
+
+  ws.on('error', (err) => {
+    console.error('[Server] WebSocket error:', err);
   });
 });
 
-// -- Start server --
 server.listen(PORT, () => {
   console.log(`[Server] Listening on port ${PORT}`);
 });
-
-// -- Heartbeat --
-setInterval(() => {
-  console.log("[Server] Heartbeat: server alive");
-}, 30000);

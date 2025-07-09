@@ -9,10 +9,11 @@ import { fileURLToPath } from 'url';
 import { Readable } from 'stream';
 import { tmpdir } from 'os';
 import sdk from 'api';
-import { GoogleGenerativeAI } from "@google/generative-ai";
 import { exec } from 'child_process';
 import util from 'util';
 import ffmpeg from 'fluent-ffmpeg';
+
+import textToSpeech from '@google-cloud/text-to-speech';
 
 const execPromise = util.promisify(exec);
 const __filename = fileURLToPath(import.meta.url);
@@ -30,9 +31,8 @@ httpServer.listen(PORT, () => {
 import OpenAI from 'openai';
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// Google TTS setup (not functional, just placeholder)
-const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY);
-const ttsModel = genAI.getGenerativeModel({ model: "gemini-pro" });
+// Google Cloud TTS setup
+const ttsClient = new textToSpeech.TextToSpeechClient();
 
 function base64ToBuffer(base64String) {
   return Buffer.from(base64String, 'base64');
@@ -101,10 +101,12 @@ async function getChatGPTResponse(prompt) {
 
 async function synthesizeTTS(text) {
   try {
-    const outputPath = path.join(tmpdir(), `tts_${Date.now()}.mp3`);
-    await execPromise(`gtts-cli "${text}" --output "${outputPath}"`);
-    const audioBuffer = fs.readFileSync(outputPath);
-    fs.unlinkSync(outputPath);
+    const [response] = await ttsClient.synthesizeSpeech({
+      input: { text },
+      voice: { languageCode: 'en-US', ssmlGender: 'NEUTRAL' },
+      audioConfig: { audioEncoding: 'MP3' },
+    });
+    const audioBuffer = response.audioContent;
     console.log(`[TTS] Audio synthesized (${audioBuffer.length} bytes)`);
     return audioBuffer;
   } catch (err) {

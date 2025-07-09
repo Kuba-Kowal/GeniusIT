@@ -24,8 +24,6 @@ const ttsClient = new textToSpeech.TextToSpeechClient();
 
 const wss = new WebSocketServer({ noServer: true });
 
-// --- Audio Conversion Functions ---
-
 function createWavHeader(dataLength, options = {}) {
   const sampleRate = options.sampleRate || 16000;
   const numChannels = options.numChannels || 1;
@@ -78,13 +76,10 @@ function resample8kTo16k(inputSamples) {
   return outputSamples;
 }
 
-// --- API Interaction Functions ---
-
-async function transcribeWhisper(muLawBuffer) {
+async function transcribeWhisper(raw8kHzPcmBuffer) {
   console.log('[Whisper] Starting transcription...');
   try {
-    const pcm8kBuffer = decodeMuLawTo16BitPCM(muLawBuffer);
-    const pcm8kSamples = new Int16Array(pcm8kBuffer.buffer, pcm8kBuffer.byteOffset, pcm8kBuffer.length / 2);
+    const pcm8kSamples = new Int16Array(raw8kHzPcmBuffer.buffer, raw8kHzPcmBuffer.byteOffset, raw8kHzPcmBuffer.length / 2);
     const pcm16kSamples = resample8kTo16k(pcm8kSamples);
     const pcm16kBuffer = Buffer.from(pcm16kSamples.buffer);
     const wavHeader = createWavHeader(pcm16kBuffer.length);
@@ -133,105 +128,80 @@ async function speakText(text, ws) {
   }
 }
 
-// --- WebSocket Connection Logic ---
-
 wss.on('connection', async (ws, req) => {
   console.log('[WS] New connection established.');
-
-  // Using VERY_AGGRESSIVE mode to be strict about detecting speech
-  const vad = new VAD(VAD.Mode.VERY_AGGRESSIVE);
-  
-  // Increased silence threshold to allow for longer pauses
-  const SILENCE_THRESHOLD_MS = 1200; 
-  const MIN_UTTERANCE_BYTES = 2400; // Minimum audio length to process (1.5s)
-
-
-  let speechBuffer = [];
-  let isSpeaking = false;
-  let silenceTimeout = null;
   let isTranscribing = false;
 
-  const processUtterance = async () => {
-    if (isTranscribing) {
-      console.log('[Process] Already transcribing, skipping utterance.');
-      return;
-    }
-    
-    if (speechBuffer.length === 0) {
-        return; // Nothing to process
-    }
+  const vadStream = VAD.createStream({
+      mode: VAD.Mode.AGGRESSIVE, // Less sensitive to noise than NORMAL
+      audioFrequency: 8000,
+      debounceTime: 1500, // Wait for 1.5s of silence before processing
+  });
 
-    const completeSpeech = Buffer.concat(speechBuffer);
-    speechBuffer = []; // Clear buffer for next time
-
-    if (completeSpeech.length < MIN_UTTERANCE_BYTES) {
-        console.log(`[Process] Utterance too short (${completeSpeech.length} bytes), ignoring.`);
-        return;
-    }
-
-    isTranscribing = true;
-    try {
-      console.log(`[VAD] Processing utterance of ${completeSpeech.length} bytes.`);
-      const transcript = await transcribeWhisper(completeSpeech);
-      
-      if (transcript && transcript.trim().length > 1) {
-        console.log(`[Process] Transcript: "${transcript}"`);
-        const chatCompletion = await openai.chat.completions.create({
-          model: 'gpt-4o-mini',
-          messages: [{ role: 'user', content: transcript }],
-        });
-        const reply = chatCompletion.choices[0].message.content;
-        console.log(`[Process] GPT reply: "${reply}"`);
-        await speakText(reply, ws);
-      } else {
-        console.log('[Process] Transcript empty, ignoring.');
+  vadStream.on('data', async (data) => {
+      // This event fires when speech has ended and silence is detected.
+      if (isTranscribing) {
+          console.log('[VAD] Already transcribing, skipping this utterance.');
+          return;
       }
-    } catch (error) {
-      console.error('[Process] Error during utterance processing:', error);
-    } finally {
-      isTranscribing = false;
-    }
-  };
+      
+      const speechAudio = data.audioData;
+      // We check the length of the raw PCM audio data
+      if (speechAudio.length < 16000) { // Was 1024, now ~1 second of audio
+          console.log(`[VAD] Utterance too short (${speechAudio.length} bytes), ignoring.`);
+          return; 
+      }
+
+      isTranscribing = true;
+      console.log(`[VAD] Speech ended. Processing ${speechAudio.length} bytes.`);
+      
+      try {
+          const transcript = await transcribeWhisper(speechAudio);
+          if (transcript && transcript.trim().length > 1) {
+              console.log(`[Process] Transcript: "${transcript}"`);
+              const chatCompletion = await openai.chat.completions.create({
+                  model: 'gpt-4o-mini',
+                  messages: [{ role: 'user', content: transcript }],
+              });
+              const reply = chatCompletion.choices[0].message.content;
+              console.log(`[Process] GPT reply: "${reply}"`);
+              await speakText(reply, ws);
+          } else {
+              console.log('[Process] Transcript empty, ignoring.');
+          }
+      } catch (error) {
+          console.error('[Process] Error during VAD data processing:', error);
+      } finally {
+          isTranscribing = false;
+      }
+  });
 
   ws.on('message', (message) => {
     try {
       const msg = JSON.parse(message.toString());
       if (msg.event === 'media') {
-        const muLawChunk = Buffer.from(msg.media.payload, 'base64');
-        const pcmChunk = decodeMuLawTo16BitPCM(muLawChunk);
-        const vadEvent = vad.process(pcmChunk);
-
-        if (vadEvent === VAD.Event.VOICE) {
-          if (silenceTimeout) clearTimeout(silenceTimeout);
-          if (!isSpeaking) {
-            console.log('[VAD] Speech started.');
-            isSpeaking = true;
-          }
-          speechBuffer.push(muLawChunk); 
-        } else if (vadEvent === VAD.Event.SILENCE && isSpeaking) {
-          silenceTimeout = setTimeout(() => {
-            console.log('[VAD] End of utterance detected by silence.');
-            isSpeaking = false;
-            processUtterance();
-          }, SILENCE_THRESHOLD_MS);
-        }
+        const pcmChunk = decodeMuLawTo16BitPCM(Buffer.from(msg.media.payload, 'base64'));
+        vadStream.write(pcmChunk);
       } else if (msg.event === 'start') {
-        console.log('[Call] Started.');
+        console.log('[Call] Call started.');
       } else if (msg.event === 'stop') {
-        console.log('[Call] Stopped.');
-        if (isSpeaking) {
-            console.log('[VAD] Call stopped mid-utterance, processing remaining audio.');
-            clearTimeout(silenceTimeout);
-            processUtterance();
-        }
+        console.log('[Call] Call stopped.');
+        vadStream.end();
       }
     } catch (error) {
       console.error('[WS] Error handling message:', error);
     }
   });
 
-  ws.on('close', () => console.log('[WS] Connection closed.'));
-  ws.on('error', (err) => console.error('[WS] Connection error:', err));
+  ws.on('close', () => {
+    console.log('[WS] Connection closed.');
+    vadStream.end();
+  });
+
+  ws.on('error', (err) => {
+    console.error('[WS] Connection error:', err);
+    vadStream.end();
+  });
 });
 
 const server = app.listen(process.env.PORT || 3000, () => {

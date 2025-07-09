@@ -5,7 +5,15 @@ import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
 import OpenAI from 'openai';
 import { TextToSpeechClient } from '@google-cloud/text-to-speech';
-import Mulaw from 'mulaw-js';
+import { Transform } from 'stream';
+import prism from 'prism-media';
+
+
+const encoder = new prism.opus.Encoder({
+  rate: 8000,
+  channels: 1,
+  frameSize: 160,
+});
 
 // Health-check server
 const server = createServer((req, res) => {

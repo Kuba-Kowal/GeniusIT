@@ -2,7 +2,7 @@
 
 import express from 'express';
 import { WebSocketServer } from 'ws';
-import fs from 'fs/promises';
+import fs from 'fs';
 import path from 'path';
 import { tmpdir } from 'os';
 import { OpenAI } from 'openai';

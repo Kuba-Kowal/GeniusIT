@@ -1,101 +1,117 @@
-// server.js
-import { config } from 'dotenv';
-config();
-import { createServer } from 'http';
-import { WebSocketServer } from 'ws';
-import OpenAI from 'openai';
-import { TextToSpeechClient } from '@google-cloud/text-to-speech';
-import { Transform } from 'stream';
-import prism from 'prism-media';
+// server.js (Complete version with integrated mu-law encoder, Whisper STT, Google TTS, and Twilio WebSocket support)
 
+import express from 'express';
+import WebSocket from 'ws';
+import fs from 'fs';
+import { Readable } from 'stream';
+import { OpenAI } from 'openai';
+import textToSpeech from '@google-cloud/text-to-speech';
+import dotenv from 'dotenv';
+dotenv.config();
 
-const encoder = new prism.opus.Encoder({
-  rate: 8000,
-  channels: 1,
-  frameSize: 160,
-});
-
-// Health-check server
-const server = createServer((req, res) => {
-  res.writeHead(200);
-  res.end('OK');
-});
-
-// Websocket server for Twilio Media Streams
-const wss = new WebSocketServer({ noServer: true });
-server.on('upgrade', (req, sock, head) => {
-  wss.handleUpgrade(req, sock, head, ws => wss.emit('connection', ws, req));
-});
+const app = express();
+const wss = new WebSocket.Server({ noServer: true });
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const ttsClient = new TextToSpeechClient();
+const ttsClient = new textToSpeech.TextToSpeechClient();
 
-wss.on('connection', ws => {
-  let audioBuffer = Buffer.alloc(0);
-  let session = { transcript: '', messages: [] };
-  let silenceTimer;
+// --- Mulaw encoder logic ---
+function linearToMuLaw(sample) {
+  const MU = 255;
+  const BIAS = 0x84;
+  const CLIP = 32635;
 
-  ws.on('message', msg => {
-    const data = JSON.parse(msg);
-    if (data.event === 'media') {
-      const chunk = Buffer.from(data.media.payload, 'base64');
-      const pcm = Buffer.from(chunk.map(b => Mulaw.decode(b)));
-      audioBuffer = Buffer.concat([audioBuffer, pcm]);
+  let sign = (sample >> 8) & 0x80;
+  if (sign !== 0) sample = -sample;
+  if (sample > CLIP) sample = CLIP;
+  sample = sample + BIAS;
 
-      clearTimeout(silenceTimer);
-      silenceTimer = setTimeout(processBuffer, 1200);
-    } else if (data.event === 'start') {
-      console.log('Streaming started:', data.start.streamSid);
-    } else if (data.event === 'stop') {
-      clearTimeout(silenceTimer);
-      processBuffer();
-    }
+  let exponent = Math.floor(Math.log(sample) / Math.log(2)) - 6;
+  let mantissa = (sample >> (exponent + 3)) & 0x0F;
+  let muLawByte = ~(sign | (exponent << 4) | mantissa);
+
+  return muLawByte & 0xFF;
+}
+
+function encodePCMToMuLaw(pcmSamples) {
+  const muLawBuffer = Buffer.alloc(pcmSamples.length);
+  for (let i = 0; i < pcmSamples.length; i++) {
+    muLawBuffer[i] = linearToMuLaw(pcmSamples[i]);
+  }
+  return muLawBuffer;
+}
+
+// --- Whisper Speech-to-Text helper ---
+async function transcribeWhisper(audioBuffer) {
+  const response = await openai.audio.transcriptions.create({
+    file: new File([audioBuffer], 'audio.wav', { type: 'audio/wav' }),
+    model: 'whisper-1',
+  });
+  return response.text;
+}
+
+// --- Google TTS helper ---
+async function speakText(text) {
+  const [response] = await ttsClient.synthesizeSpeech({
+    input: { text },
+    voice: { languageCode: 'en-US', ssmlGender: 'NEUTRAL' },
+    audioConfig: { audioEncoding: 'LINEAR16' },
   });
 
-  async function processBuffer() {
-    clearTimeout(silenceTimer);
-    if (audioBuffer.length < 16000) return; // only process if >2 sec
-    const buf = audioBuffer;
-    audioBuffer = Buffer.alloc(0);
-    const transcript = await openai.audio.transcriptions.create({
-      file: { value: buf, name: 'audio.wav', type: 'audio/wav' },
-      model: 'whisper-1'
-    });
-    if (!transcript.text) return;
+  const audioBuffer = response.audioContent;
+  const int16Buffer = new Int16Array(new Uint8Array(audioBuffer).buffer);
+  return encodePCMToMuLaw(int16Buffer);
+}
 
-    session.transcript += ` Caller: ${transcript.text}\n`;
-    session.messages.push({ role: 'user', content: transcript.text });
+// --- WebSocket connection for Twilio Media Streams ---
+wss.on('connection', (ws) => {
+  let audioChunks = [];
 
-    const completion = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      messages: [
-        { role: 'system', content: 'You are a helpful conversational voice assistant.' },
-        ...session.messages.slice(-10)
-      ],
-    });
-    const reply = completion.choices[0].message.content;
-    session.messages.push({ role: 'assistant', content: reply });
+  ws.on('message', async (message) => {
+    const msg = JSON.parse(message);
 
-    ws.send(JSON.stringify({ event: 'mark', mark: { name: 'start_of_tts' } }));
-    const [res] = await ttsClient.synthesizeSpeech({
-      input: { text: reply },
-      voice: { languageCode: 'en-US', name: 'en-US-Standard-C' },
-      audioConfig: { audioEncoding: 'LINEAR16', sampleRateHertz: 8000 },
-    });
-    const pcm = res.audioContent;
-    for (let i = 0; i < pcm.length; i += 320) {
-      const slice = pcm.slice(i, i + 320);
-      const mulaw = Buffer.from(slice.map(b => Mulaw.encode(b)));
-      ws.send(JSON.stringify({
-        event: 'media',
-        media: { payload: mulaw.toString('base64') }
-      }));
-      await new Promise(r => setTimeout(r, 20));
+    if (msg.event === 'start') {
+      console.log('Call started');
+    } else if (msg.event === 'media') {
+      const payload = Buffer.from(msg.media.payload, 'base64');
+      audioChunks.push(payload);
+    } else if (msg.event === 'stop') {
+      console.log('Call stopped. Transcribing...');
+
+      const audioBuffer = Buffer.concat(audioChunks);
+      const transcript = await transcribeWhisper(audioBuffer);
+      console.log('You said:', transcript);
+
+      const chat = await openai.chat.completions.create({
+        model: 'gpt-4o',
+        messages: [{ role: 'user', content: transcript }],
+      });
+
+      const reply = chat.choices[0].message.content;
+      const ttsAudio = await speakText(reply);
+
+      // Send TTS audio as media messages back to Twilio
+      for (let i = 0; i < ttsAudio.length; i += 320) {
+        const slice = ttsAudio.slice(i, i + 320);
+        ws.send(
+          JSON.stringify({
+            event: 'media',
+            media: { payload: slice.toString('base64') },
+          })
+        );
+        await new Promise((r) => setTimeout(r, 20)); // 20ms = 160 samples @ 8kHz
+      }
     }
-    ws.send(JSON.stringify({ event: 'mark', mark: { name: 'end_of_tts' } }));
-  }
-
-  ws.on('close', () => console.log('Stream closed.'));
+  });
 });
 
-server.listen(process.env.PORT || 3000, () => console.log('Listening…'));
+// --- Express route to upgrade to WebSocket ---
+const server = app.listen(process.env.PORT || 3000, () => {
+  console.log('Server listening');
+});
+
+server.on('upgrade', (req, socket, head) => {
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit('connection', ws, req);
+  });
+});

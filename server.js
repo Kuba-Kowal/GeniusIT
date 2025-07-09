@@ -5,7 +5,8 @@ import path from 'path';
 import { tmpdir } from 'os';
 import { OpenAI } from 'openai';
 import textToSpeech from '@google-cloud/text-to-speech';
-import resample from 'wave-resampler'; // <-- THIS LINE IS FIXED
+import waveResampler from 'wave-resampler'; // <-- Correctly import the module object
+const { resample } = waveResampler;     // <-- Extract the function from the object
 import dotenv from 'dotenv';
 dotenv.config();
 

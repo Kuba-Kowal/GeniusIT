@@ -133,9 +133,9 @@ wss.on('connection', async (ws, req) => {
   let isTranscribing = false;
 
   const vadStream = VAD.createStream({
-      mode: VAD.Mode.AGGRESSIVE, // Less sensitive to noise than NORMAL
+      mode: VAD.Mode.NORMAL,       // Sensitive enough to detect speech
       audioFrequency: 8000,
-      debounceTime: 1500, // Wait for 1.5s of silence before processing
+      debounceTime: 1000,           // Wait 1s after speech stops
   });
 
   vadStream.on('data', async (data) => {
@@ -146,8 +146,8 @@ wss.on('connection', async (ws, req) => {
       }
       
       const speechAudio = data.audioData;
-      // We check the length of the raw PCM audio data
-      if (speechAudio.length < 16000) { // Was 1024, now ~1 second of audio
+      // Filter out short noise bursts by checking the length
+      if (speechAudio.length < 8000) { // ~0.5 seconds of 8kHz 16-bit audio
           console.log(`[VAD] Utterance too short (${speechAudio.length} bytes), ignoring.`);
           return; 
       }

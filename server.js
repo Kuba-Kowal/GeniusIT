@@ -103,18 +103,24 @@ wss.on('connection', (ws) => {
             if (data.type === 'INIT_VOICE') {
                 console.log('[WS] Switching to voice mode.');
                 connectionMode = 'voice';
-                const reply = "Voice connection enabled. I'm listening.";
-                // We don't push this to history as it's a system message
-                await speakText(reply, ws, currentLanguage);
+                // **REMOVED**: No longer sending an initial audio message to prevent glitches.
                 return;
-            } else if (data.type === 'TEXT_MESSAGE') {
+            }
+
+            // **NEW**: Handle ending the voice call
+            if (data.type === 'END_VOICE') {
+                console.log('[WS] Switching back to text mode.');
+                connectionMode = 'text';
+                return;
+            }
+
+            if (data.type === 'TEXT_MESSAGE') {
                 transcript = data.text;
             } else if (data.type === 'END_OF_STREAM') {
                 if (audioBufferArray.length === 0) return;
                 const completeAudioBuffer = Buffer.concat(audioBufferArray);
                 audioBufferArray = [];
                 transcript = await transcribeWhisper(completeAudioBuffer, currentLanguage);
-                // **NEW**: Send the user's transcript back to the client for display
                 if (transcript && transcript.trim() && ws.readyState === 1) {
                     ws.send(JSON.stringify({ type: 'USER_TRANSCRIPT', text: transcript }));
                 }
@@ -125,7 +131,6 @@ wss.on('connection', (ws) => {
                 const reply = await getAIReply(conversationHistory);
                 conversationHistory.push({ role: 'assistant', content: reply });
 
-                // **MODIFIED**: Always send AI text reply, then send audio if in voice mode
                 if (ws.readyState === 1) {
                     ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: reply }));
                 }

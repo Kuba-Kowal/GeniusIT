@@ -25,6 +25,8 @@ async function transcribeWhisper(audioBuffer) {
     const response = await openai.audio.transcriptions.create({
       file: fileStream,
       model: 'whisper-1',
+      // THIS LINE FORCES WHISPER TO USE ENGLISH
+      language: 'en', 
     });
 
     console.log(`[Whisper] Transcription: "${response.text}"`);
@@ -61,66 +63,66 @@ wss.on('connection', (ws) => {
     console.log('[WS] New persistent connection established.');
     let audioBufferArray = [];
 
-    // CHANGED: This logic is now more robust.
     ws.on('message', async (message) => {
         let isSignal = false;
-
         try {
-            // The 'ws' library can deliver text messages as a Buffer.
-            // We must convert it to a string to reliably parse it as JSON.
             const messageString = message.toString();
-
-            if (messageString.includes('END_OF_STREAM')) { // Quick check to avoid unnecessary JSON parsing
+            if (messageString.includes('END_OF_STREAM')) {
                 const data = JSON.parse(messageString);
                 if (data.type === 'END_OF_STREAM') {
                     isSignal = true;
                     console.log('[WS] End of stream signal received.');
-
+                    
                     if (audioBufferArray.length === 0) {
                         console.log('[Process] No audio data received, ignoring.');
                         return;
                     }
-                    
-                    const completeAudioBuffer = Buffer.concat(audioBufferArray);
-                    audioBufferArray = []; // Clear buffer for the next utterance
 
-                    console.log(`[Process] Processing complete audio of ${completeAudioBuffer.length} bytes.`);
-                    
-                    const transcript = await transcribeWhisper(completeAudioBuffer);
-                    
-                    if (transcript && transcript.trim().length > 1) {
-                        console.log(`[Process] Transcript: "${transcript}"`);
-                        const chatCompletion = await openai.chat.completions.create({
-                            model: 'gpt-4o-mini',
-                            messages: [{ role: 'user', content: transcript }],
-                        });
-                        const reply = chatCompletion.choices[0].message.content;
-                        console.log(`[Process] GPT reply: "${reply}"`);
-                        await speakText(reply, ws);
-                    } else {
-                        console.log('[Process] Transcript empty or too short, ignoring.');
+                    try {
+                        const completeAudioBuffer = Buffer.concat(audioBufferArray);
+                        audioBufferArray = [];
+
+                        console.log(`[Process] Processing complete audio of ${completeAudioBuffer.length} bytes.`);
+                        
+                        const transcript = await transcribeWhisper(completeAudioBuffer);
+                        
+                        if (transcript && transcript.trim().length > 1) {
+                            console.log(`[Process] Transcript: "${transcript}"`);
+                            const chatCompletion = await openai.chat.completions.create({
+                                model: 'gpt-4o-mini',
+                                messages: [{ role: 'user', content: transcript }],
+                            });
+                            const reply = chatCompletion.choices[0].message.content;
+                            console.log(`[Process] GPT reply: "${reply}"`);
+                            await speakText(reply, ws);
+                        } else {
+                            console.log('[Process] Transcript empty or too short, ignoring.');
+                        }
+                    } catch (pipelineError) {
+                        console.error('[Process] Error in AI processing pipeline:', pipelineError);
+                        if (ws.readyState === 1) {
+                            ws.send(JSON.stringify({ type: 'error', message: 'An error occurred while processing your request.' }));
+                        }
                     }
                 }
             }
         } catch (error) {
-            // This error is expected if the message is an audio chunk, as it's not valid JSON.
-            // We can safely ignore it and proceed.
+           // Expected error for audio chunks, ignore.
         }
 
         if (!isSignal && Buffer.isBuffer(message)) {
-            // If it wasn't the signal, it must be an audio chunk.
             audioBufferArray.push(message);
         }
     });
 
     ws.on('close', () => {
         console.log('[WS] Connection closed.');
-        audioBufferArray = []; // Clean up resources
+        audioBufferArray = [];
     });
 
     ws.on('error', (err) => {
         console.error('[WS] Connection error:', err);
-        audioBufferArray = []; // Clean up resources
+        audioBufferArray = [];
     });
 });
 

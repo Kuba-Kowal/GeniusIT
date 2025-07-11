@@ -11,16 +11,11 @@ dotenv.config();
 const app = express();
 app.use(express.json());
 
-// --- NEW: SECURE DOWNLOAD ENDPOINT ---
-// This allows you to download files from the 'recordings' directory.
 app.get('/recordings/:filename', (req, res) => {
-    // Sanitize the filename to prevent users from accessing other directories
     const filename = path.basename(req.params.filename);
     const recordingsDir = path.join(process.cwd(), 'recordings');
     const filePath = path.join(recordingsDir, filename);
 
-    // Use res.download to send the file and prompt the browser to save it.
-    // It also handles cases where the file doesn't exist.
     res.download(filePath, (err) => {
         if (err) {
             console.error('[Download] Error sending file:', err);
@@ -30,7 +25,6 @@ app.get('/recordings/:filename', (req, res) => {
         }
     });
 });
-// --- END OF NEW CODE ---
 
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -104,15 +98,7 @@ wss.on('connection', (ws) => {
                         const completeAudioBuffer = Buffer.concat(audioBufferArray);
                         audioBufferArray = [];
 
-                        try {
-                            const recordingsDir = path.join(process.cwd(), 'recordings');
-                            await fs.promises.mkdir(recordingsDir, { recursive: true });
-                            const savePath = path.join(recordingsDir, `recording-${Date.now()}.webm`);
-                            await fs.promises.writeFile(savePath, completeAudioBuffer);
-                            console.log(`[Debug] Audio successfully saved to: ${savePath}`);
-                        } catch (saveError) {
-                            console.error('[Debug] Failed to save audio file:', saveError);
-                        }
+                        // The code for saving the audio file has been removed from here.
 
                         console.log(`[Process] Processing complete audio of ${completeAudioBuffer.length} bytes.`);
                         
@@ -120,10 +106,26 @@ wss.on('connection', (ws) => {
                         
                         if (transcript && transcript.trim().length > 1) {
                             console.log(`[Process] Transcript: "${transcript}"`);
+                            
+                            // --- NEW: SYSTEM PROMPT TO DEFINE AI PERSONALITY ---
                             const chatCompletion = await openai.chat.completions.create({
                                 model: 'gpt-4o-mini',
-                                messages: [{ role: 'user', content: transcript }],
+                                messages: [
+                                    {
+                                        role: 'system',
+                                        content: `You are a friendly, witty, and curious AI voice assistant. Your goal is to have a natural, back-and-forth conversation, not to give long lectures.
+                                        1. Keep your responses short and conversational.
+                                        2. If a user asks a broad question (like "tell me about football"), ask a clarifying question to get more details (e.g., "Sure, what about it interests you most?") instead of providing a long answer.
+                                        3. Use a touch of light humor where appropriate.`
+                                    },
+                                    {
+                                        role: 'user', 
+                                        content: transcript 
+                                    }
+                                ],
                             });
+                            // --- END OF NEW CODE ---
+
                             const reply = chatCompletion.choices[0].message.content;
                             console.log(`[Process] GPT reply: "${reply}"`);
                             await speakText(reply, ws);

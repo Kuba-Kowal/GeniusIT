@@ -11,9 +11,6 @@ dotenv.config();
 const app = express();
 app.use(express.json());
 
-// This endpoint is no longer needed as we removed the file saving logic.
-// app.get('/recordings/:filename', ...);
-
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const ttsClient = new textToSpeech.TextToSpeechClient();
 const wss = new WebSocketServer({ noServer: true });
@@ -66,14 +63,15 @@ wss.on('connection', (ws) => {
     console.log('[WS] New persistent connection established.');
     let audioBufferArray = [];
 
-    // --- NEW: INITIALIZE CONVERSATION HISTORY FOR THIS SESSION ---
+    // --- REFINED SYSTEM PROMPT ---
     let conversationHistory = [
         {
             role: 'system',
-            content: `You are a friendly, witty, and curious AI voice assistant. Your goal is to have a natural, back-and-forth conversation, not to give long lectures.
-            1. Keep your responses short and conversational.
-            2. If a user asks a broad question (like "tell me about football"), ask a clarifying question to get more details (e.g., "Sure, what about it interests you most?") instead of providing a long answer.
-            3. Use a touch of light humor where appropriate.`
+            content: `You are a helpful and friendly AI voice assistant. Your goal is to have a natural, clear conversation.
+            1.  **Be Honest:** If you don't know something or a request is nonsensical (like "Rigatoni McScroni"), admit it politely and ask for clarification instead of inventing an answer. For example, say "I've never heard of that dish, could you tell me more?"
+            2.  **Stay Focused:** If you ask a question and the user's reply doesn't answer it, gently guide the conversation back. For example, if you ask "Do you want a hearty or veggie recipe?" and the user says "I'm feeling good," you should respond with something like, "That's great to hear! To find the right recipe, could you let me know if you'd prefer a meat or veggie dish?"
+            3.  **Control Length:** Keep your answers concise. Only provide long, detailed responses (like full recipes or technical guides) when the user explicitly asks for them. Otherwise, provide brief summaries and ask followup questions.
+            4.  **Clarify Broad Topics:** For general questions like "tell me about football," always ask a clarifying question to narrow down the topic first.`
         }
     ];
 
@@ -103,24 +101,20 @@ wss.on('connection', (ws) => {
                         if (transcript && transcript.trim().length > 1) {
                             console.log(`[Process] Transcript: "${transcript}"`);
                             
-                            // --- CHANGED: ADD USER'S MESSAGE TO HISTORY ---
                             conversationHistory.push({ role: 'user', content: transcript });
                             
                             const chatCompletion = await openai.chat.completions.create({
                                 model: 'gpt-4o-mini',
-                                // --- CHANGED: SEND THE ENTIRE HISTORY ---
                                 messages: conversationHistory,
                             });
                             
                             const reply = chatCompletion.choices[0].message.content;
 
-                            // --- CHANGED: ADD AI'S RESPONSE TO HISTORY ---
                             conversationHistory.push({ role: 'assistant', content: reply });
 
-                            // Optional: Trim history to prevent it from getting too long
-                            const maxHistoryTurns = 5; // 5 turns = 1 system, 5 user, 5 assistant msgs
+                            const maxHistoryTurns = 5;
                             while (conversationHistory.length > (maxHistoryTurns * 2 + 1)) {
-                                conversationHistory.splice(1, 2); // Remove the oldest user/assistant pair
+                                conversationHistory.splice(1, 2);
                             }
 
                             console.log(`[Process] GPT reply: "${reply}"`);
@@ -148,13 +142,13 @@ wss.on('connection', (ws) => {
     ws.on('close', () => {
         console.log('[WS] Connection closed.');
         audioBufferArray = [];
-        conversationHistory = []; // Clear history on disconnect
+        conversationHistory = [];
     });
 
     ws.on('error', (err) => {
         console.error('[WS] Connection error:', err);
         audioBufferArray = [];
-        conversationHistory = []; // Clear history on error
+        conversationHistory = [];
     });
 });
 

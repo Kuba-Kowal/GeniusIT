@@ -16,12 +16,10 @@ const wss = new WebSocketServer({ noServer: true });
 
 async function transcribeWhisper(audioBuffer) {
   console.log('[Whisper] Starting transcription...');
-  const tempFilePath = path.join(tmpdir(), `audio_${Date.now()}.wav`); // Expecting a wav file
+  const tempFilePath = path.join(tmpdir(), `audio_${Date.now()}.wav`);
   
   try {
-    // Save the incoming WAV file buffer to a temp file
     await fs.promises.writeFile(tempFilePath, audioBuffer);
-    console.log(`[Whisper] Audio file saved to ${tempFilePath}`);
     
     const fileStream = fs.createReadStream(tempFilePath);
     const response = await openai.audio.transcriptions.create({
@@ -45,13 +43,12 @@ async function speakText(text, ws) {
     const [response] = await ttsClient.synthesizeSpeech({
       input: { text },
       voice: { languageCode: 'en-US', ssmlGender: 'NEUTRAL' },
-      audioConfig: { audioEncoding: 'MP3' }, // MP3 is efficient for browser playback
+      audioConfig: { audioEncoding: 'MP3' },
     });
     const audioContent = response.audioContent;
     console.log(`[TTS] Synthesized ${audioContent.length} bytes of MP3 audio.`);
 
     if (ws.readyState === 1) {
-        // Send the entire MP3 file back to the browser
         ws.send(audioContent);
     }
     console.log('[TTS] Finished sending audio.');
@@ -61,14 +58,12 @@ async function speakText(text, ws) {
 }
 
 wss.on('connection', (ws) => {
-  console.log('[WS] New connection established.');
+  console.log('[WS] New persistent connection established.');
 
   ws.on('message', async (message) => {
-    console.log('[WS] Received audio message from client.');
-    
     try {
-      // The message is the complete audio file buffer
       const audioBuffer = Buffer.isBuffer(message) ? message : Buffer.from(message);
+      console.log(`[WS] Received audio message of ${audioBuffer.length} bytes.`);
       
       const transcript = await transcribeWhisper(audioBuffer);
       
@@ -83,6 +78,10 @@ wss.on('connection', (ws) => {
         await speakText(reply, ws);
       } else {
         console.log('[Process] Transcript empty, ignoring.');
+        // Optionally, send a message back to the client that nothing was heard
+        if (ws.readyState === 1) {
+          ws.send(JSON.stringify({ type: 'error', message: 'No speech detected.' }));
+        }
       }
     } catch (error) {
       console.error('[Process] Error processing message:', error);

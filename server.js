@@ -23,7 +23,7 @@ const ttsClient = new textToSpeech.TextToSpeechClient();
 
 const wss = new WebSocketServer({ noServer: true });
 
-// --- Audio Conversion Functions ---
+// --- Audio Helper Functions ---
 function createWavHeader(dataLength, options = {}) {
   const sampleRate = options.sampleRate || 16000;
   const numChannels = options.numChannels || 1;
@@ -47,46 +47,15 @@ function createWavHeader(dataLength, options = {}) {
   return buffer;
 }
 
-function muLawToLinear(muLawByte) {
-  const MULAW_BIAS = 33;
-  muLawByte = ~muLawByte & 0xFF;
-  let sign = (muLawByte & 0x80) ? -1 : 1;
-  let exponent = (muLawByte >> 4) & 0x07;
-  let mantissa = muLawByte & 0x0F;
-  let sample = ((mantissa << 3) + MULAW_BIAS) << exponent;
-  return sign * sample;
-}
-
-function decodeMuLawTo16BitPCM(muLawBuffer) {
-  const pcmSamples = new Int16Array(muLawBuffer.length);
-  for (let i = 0; i < muLawBuffer.length; i++) {
-    pcmSamples[i] = muLawToLinear(muLawBuffer[i]);
-  }
-  return pcmSamples;
-}
-
-function resample8kTo16k(inputSamples) {
-  const outputLength = inputSamples.length * 2;
-  const outputSamples = new Int16Array(outputLength);
-  for (let i = 0; i < inputSamples.length - 1; i++) {
-    outputSamples[2 * i] = inputSamples[i];
-    outputSamples[2 * i + 1] = ((inputSamples[i] + inputSamples[i + 1]) / 2) | 0;
-  }
-  outputSamples[outputLength - 1] = inputSamples[inputSamples.length - 1];
-  return outputSamples;
-}
-
 // --- API Interaction Functions ---
-async function transcribeWhisper(muLawBuffer) {
+async function transcribeWhisper(pcmBuffer) {
   console.log('[Whisper] Starting transcription...');
   try {
-    const pcm8kSamples = decodeMuLawTo16BitPCM(muLawBuffer);
-    const pcm16kSamples = resample8kTo16k(pcm8kSamples);
-    const pcm16kBuffer = Buffer.from(pcm16kSamples.buffer);
-    const wavHeader = createWavHeader(pcm16kBuffer.length);
+    // Audio is already 16kHz PCM, so we just add the WAV header
+    const wavHeader = createWavHeader(pcmBuffer.length);
     const fileName = `audio_${Date.now()}.wav`;
     const tempFilePath = path.join(tempDir, fileName);
-    const wavBuffer = Buffer.concat([wavHeader, pcm16kBuffer]);
+    const wavBuffer = Buffer.concat([wavHeader, pcmBuffer]);
     await fs.promises.writeFile(tempFilePath, wavBuffer);
     const publicUrl = `https://${process.env.RENDER_EXTERNAL_HOSTNAME}/downloads/${fileName}`;
     console.log(`[Whisper] WAV file available for download: ${publicUrl}`);
@@ -110,16 +79,14 @@ async function speakText(text, ws) {
     const [response] = await ttsClient.synthesizeSpeech({
       input: { text },
       voice: { languageCode: 'en-US', ssmlGender: 'NEUTRAL' },
-      audioConfig: { audioEncoding: 'MULAW', sampleRateHertz: 8000 },
+      // Send back high-quality audio for the browser to play
+      audioConfig: { audioEncoding: 'LINEAR16', sampleRateHertz: 16000 },
     });
     const audioContent = response.audioContent;
     console.log(`[TTS] Synthesized ${audioContent.length} bytes of audio.`);
-    for (let i = 0; i < audioContent.length; i += 640) {
-        const chunk = audioContent.slice(i, i + 640);
-        if (ws.readyState === 1) {
-            ws.send(JSON.stringify({ event: 'media', media: { payload: chunk.toString('base64') } }));
-        }
-        await new Promise(r => setTimeout(r, 40));
+    // Send the entire audio content as one message for the browser to handle
+    if (ws.readyState === 1) {
+        ws.send(audioContent);
     }
     console.log('[TTS] Finished sending audio.');
   } catch (error) {
@@ -131,9 +98,9 @@ async function speakText(text, ws) {
 wss.on('connection', (ws, req) => {
   console.log('[WS] New connection established.');
 
-  const ENERGY_THRESHOLD = 300; // Adjust this to change voice sensitivity.
-  const SILENCE_THRESHOLD_MS = 800; // 0.8s of silence ends an utterance.
-  const MIN_UTTERANCE_BYTES = 8000; // ~0.5s of audio to be considered.
+  const ENERGY_THRESHOLD = 500; // Adjust for 16kHz PCM audio
+  const SILENCE_THRESHOLD_MS = 800;
+  const MIN_UTTERANCE_BYTES = 16000; // ~0.5s of 16kHz audio
 
   let speechBuffer = [];
   let isSpeaking = false;
@@ -175,14 +142,12 @@ wss.on('connection', (ws, req) => {
     }
   };
 
+  // This connection now expects raw PCM audio chunks, not JSON messages
   ws.on('message', (message) => {
     try {
-      const msg = JSON.parse(message.toString());
-      if (msg.event === 'media') {
-        const muLawChunk = Buffer.from(msg.media.payload, 'base64');
-        const pcmSamples = decodeMuLawTo16BitPCM(muLawChunk);
-        
-        // Simple energy detection
+        const pcmChunk = Buffer.isBuffer(message) ? message : Buffer.from(message);
+        const pcmSamples = new Int16Array(pcmChunk.buffer, pcmChunk.byteOffset, pcmChunk.length / 2);
+
         let energy = 0;
         for (let i = 0; i < pcmSamples.length; i++) {
             energy += Math.abs(pcmSamples[i]);
@@ -194,7 +159,7 @@ wss.on('connection', (ws, req) => {
                 console.log(`[VAD] Speech started. (Energy: ${energy.toFixed(2)})`);
                 isSpeaking = true;
             }
-            speechBuffer.push(muLawChunk);
+            speechBuffer.push(pcmChunk);
             if (silenceTimeout) clearTimeout(silenceTimeout);
             silenceTimeout = setTimeout(() => {
                 console.log('[VAD] End of utterance due to silence.');
@@ -202,16 +167,6 @@ wss.on('connection', (ws, req) => {
                 processUtterance();
             }, SILENCE_THRESHOLD_MS);
         }
-
-      } else if (msg.event === 'start') {
-        console.log('[Call] Started.');
-      } else if (msg.event === 'stop') {
-        console.log('[Call] Stopped.');
-        if (isSpeaking) {
-            clearTimeout(silenceTimeout);
-            processUtterance();
-        }
-      }
     } catch (error) {
       console.error('[WS] Error handling message:', error);
     }

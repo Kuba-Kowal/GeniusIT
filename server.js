@@ -16,10 +16,10 @@ const wss = new WebSocketServer({ noServer: true });
 
 async function transcribeWhisper(audioBuffer) {
   console.log('[Whisper] Starting transcription...');
-  const tempFilePath = path.join(tmpdir(), `audio_${Date.now()}.webm`);
+  const tempFilePath = path.join(tmpdir(), `audio_${Date.now()}.wav`); // Expecting a wav file
   
   try {
-    // Save the incoming audio buffer (which is likely a webm) to a temp file
+    // Save the incoming WAV file buffer to a temp file
     await fs.promises.writeFile(tempFilePath, audioBuffer);
     console.log(`[Whisper] Audio file saved to ${tempFilePath}`);
     
@@ -35,7 +35,6 @@ async function transcribeWhisper(audioBuffer) {
     console.error('[Whisper] Transcription error:', error);
     throw error;
   } finally {
-    // Clean up the temporary file
     await fs.promises.unlink(tempFilePath);
   }
 }

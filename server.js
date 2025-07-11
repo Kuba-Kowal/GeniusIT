@@ -16,20 +16,15 @@ const ttsClient = new textToSpeech.TextToSpeechClient();
 const wss = new WebSocketServer({ noServer: true });
 
 async function transcribeWhisper(audioBuffer) {
-  console.log('[Whisper] Starting transcription...');
   const tempFilePath = path.join(tmpdir(), `audio_${Date.now()}.webm`);
-  
   try {
     await fs.promises.writeFile(tempFilePath, audioBuffer);
-    
     const fileStream = fs.createReadStream(tempFilePath);
     const response = await openai.audio.transcriptions.create({
       file: fileStream,
       model: 'whisper-1',
       language: 'en', 
     });
-
-    console.log(`[Whisper] Transcription: "${response.text}"`);
     return response.text;
   } catch (error) {
     console.error('[Whisper] Transcription error:', error);
@@ -39,21 +34,22 @@ async function transcribeWhisper(audioBuffer) {
   }
 }
 
+async function getAIReply(history) {
+    const chatCompletion = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: history,
+    });
+    return chatCompletion.choices[0].message.content;
+}
+
 async function speakText(text, ws) {
-  console.log(`[TTS] Synthesizing: "${text}"`);
   try {
     const [response] = await ttsClient.synthesizeSpeech({
       input: { text },
       voice: { languageCode: 'en-US', ssmlGender: 'NEUTRAL' },
       audioConfig: { audioEncoding: 'MP3' },
     });
-    const audioContent = response.audioContent;
-    console.log(`[TTS] Synthesized ${audioContent.length} bytes of MP3 audio.`);
-
-    if (ws.readyState === 1) {
-        ws.send(audioContent);
-    }
-    console.log('[TTS] Finished sending audio.');
+    if (ws.readyState === 1) ws.send(response.audioContent);
   } catch (error) {
     console.error('[TTS] Synthesis error:', error);
   }
@@ -62,8 +58,8 @@ async function speakText(text, ws) {
 wss.on('connection', (ws) => {
     console.log('[WS] New persistent connection established.');
     let audioBufferArray = [];
-
-    // --- YOUR NEW SYSTEM PROMPT IS INCLUDED HERE ---
+    let connectionMode = 'text'; // Start in text mode by default
+    
     let conversationHistory = [
         {
             role: 'system',
@@ -75,92 +71,64 @@ wss.on('connection', (ws) => {
         }
     ];
     
-    // --- NEW: SEND A WELCOME MESSAGE ON CONNECTION ---
-    try {
-        const welcomeMessage = "Hello! My name is Alex. How can I help you today?";
-        // The speakText function will convert this to audio and send it to the client.
-        speakText(welcomeMessage, ws);
-    } catch (error) {
-        console.error('[Welcome] Failed to send welcome message:', error);
+    // Send the welcome message as a text-based JSON object
+    const welcomeMessage = "Hello! My name is Alex. How can I help you today?";
+    if (ws.readyState === 1) {
+        ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: welcomeMessage }));
     }
-    // --- END OF NEW CODE ---
-
 
     ws.on('message', async (message) => {
-        let isSignal = false;
         try {
-            const messageString = message.toString();
-            if (messageString.includes('END_OF_STREAM')) {
-                const data = JSON.parse(messageString);
-                if (data.type === 'END_OF_STREAM') {
-                    isSignal = true;
-                    console.log('[WS] End of stream signal received.');
-                    
-                    if (audioBufferArray.length === 0) {
-                        console.log('[Process] No audio data received, ignoring.');
-                        return;
-                    }
+            // Audio chunks are raw buffers, so handle them first.
+            if (Buffer.isBuffer(message)) {
+                audioBufferArray.push(message);
+                return;
+            }
 
-                    try {
-                        const completeAudioBuffer = Buffer.concat(audioBufferArray);
-                        audioBufferArray = [];
+            // All other messages are expected to be JSON strings
+            const data = JSON.parse(message.toString());
+            let transcript = '';
 
-                        console.log(`[Process] Processing complete audio of ${completeAudioBuffer.length} bytes.`);
-                        
-                        const transcript = await transcribeWhisper(completeAudioBuffer);
-                        
-                        if (transcript && transcript.trim().length > 1) {
-                            console.log(`[Process] Transcript: "${transcript}"`);
-                            
-                            conversationHistory.push({ role: 'user', content: transcript });
-                            
-                            const chatCompletion = await openai.chat.completions.create({
-                                model: 'gpt-4o-mini',
-                                messages: conversationHistory,
-                            });
-                            
-                            const reply = chatCompletion.choices[0].message.content;
+            // Handle different types of messages from the client
+            if (data.type === 'INIT_VOICE') {
+                console.log('[WS] Switching to voice mode.');
+                connectionMode = 'voice';
+                const reply = "Voice connection enabled. I'm now listening.";
+                conversationHistory.push({ role: 'assistant', content: reply });
+                await speakText(reply, ws);
+                return;
+            } else if (data.type === 'TEXT_MESSAGE') {
+                transcript = data.text;
+            } else if (data.type === 'END_OF_STREAM') {
+                if (audioBufferArray.length === 0) return;
+                const completeAudioBuffer = Buffer.concat(audioBufferArray);
+                audioBufferArray = [];
+                transcript = await transcribeWhisper(completeAudioBuffer);
+            }
 
-                            conversationHistory.push({ role: 'assistant', content: reply });
+            // Process the transcript through the AI if we have one
+            if (transcript && transcript.trim()) {
+                console.log(`[Process] User input: "${transcript}"`);
+                conversationHistory.push({ role: 'user', content: transcript });
 
-                            const maxHistoryTurns = 5;
-                            while (conversationHistory.length > (maxHistoryTurns * 2 + 1)) {
-                                conversationHistory.splice(1, 2);
-                            }
+                const reply = await getAIReply(conversationHistory);
+                conversationHistory.push({ role: 'assistant', content: reply });
+                console.log(`[Process] AI reply: "${reply}"`);
 
-                            console.log(`[Process] GPT reply: "${reply}"`);
-                            await speakText(reply, ws);
-                        } else {
-                            console.log('[Process] Transcript empty or too short, ignoring.');
-                        }
-                    } catch (pipelineError) {
-                        console.error('[Process] Error in AI processing pipeline:', pipelineError);
-                        if (ws.readyState === 1) {
-                            ws.send(JSON.stringify({ type: 'error', message: 'An error occurred while processing your request.' }));
-                        }
-                    }
+                // Respond in the correct format based on the connection mode
+                if (connectionMode === 'text') {
+                    if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: reply }));
+                } else { // connectionMode is 'voice'
+                    await speakText(reply, ws);
                 }
             }
         } catch (error) {
-           // Expected error for audio chunks, ignore.
-        }
-
-        if (!isSignal && Buffer.isBuffer(message)) {
-            audioBufferArray.push(message);
+            console.error('[Process] Error processing message:', error);
         }
     });
 
-    ws.on('close', () => {
-        console.log('[WS] Connection closed.');
-        audioBufferArray = [];
-        conversationHistory = [];
-    });
-
-    ws.on('error', (err) => {
-        console.error('[WS] Connection error:', err);
-        audioBufferArray = [];
-        conversationHistory = [];
-    });
+    ws.on('close', () => console.log('[WS] Connection closed.'));
+    ws.on('error', (err) => console.error('[WS] Connection error:', err));
 });
 
 const server = app.listen(process.env.PORT || 3000, () => {

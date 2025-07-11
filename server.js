@@ -16,7 +16,6 @@ const wss = new WebSocketServer({ noServer: true });
 
 async function transcribeWhisper(audioBuffer) {
   console.log('[Whisper] Starting transcription...');
-  // The client sends webm, not wav
   const tempFilePath = path.join(tmpdir(), `audio_${Date.now()}.webm`);
   
   try {
@@ -34,7 +33,6 @@ async function transcribeWhisper(audioBuffer) {
     console.error('[Whisper] Transcription error:', error);
     throw error;
   } finally {
-    // Make sure the file is unlinked even if transcription fails
     await fs.promises.unlink(tempFilePath).catch(err => console.error("Error deleting temp file:", err));
   }
 }
@@ -61,13 +59,21 @@ async function speakText(text, ws) {
 
 wss.on('connection', (ws) => {
     console.log('[WS] New persistent connection established.');
-    let audioBufferArray = []; // Buffer for this specific connection
+    let audioBufferArray = [];
 
+    // CHANGED: This logic is now more robust.
     ws.on('message', async (message) => {
-        if (typeof message === 'string') {
-            try {
-                const data = JSON.parse(message);
+        let isSignal = false;
+
+        try {
+            // The 'ws' library can deliver text messages as a Buffer.
+            // We must convert it to a string to reliably parse it as JSON.
+            const messageString = message.toString();
+
+            if (messageString.includes('END_OF_STREAM')) { // Quick check to avoid unnecessary JSON parsing
+                const data = JSON.parse(messageString);
                 if (data.type === 'END_OF_STREAM') {
+                    isSignal = true;
                     console.log('[WS] End of stream signal received.');
 
                     if (audioBufferArray.length === 0) {
@@ -95,10 +101,14 @@ wss.on('connection', (ws) => {
                         console.log('[Process] Transcript empty or too short, ignoring.');
                     }
                 }
-            } catch (e) {
-                console.log(`[WS] Received non-JSON text message: ${message}`);
             }
-        } else if (Buffer.isBuffer(message)) {
+        } catch (error) {
+            // This error is expected if the message is an audio chunk, as it's not valid JSON.
+            // We can safely ignore it and proceed.
+        }
+
+        if (!isSignal && Buffer.isBuffer(message)) {
+            // If it wasn't the signal, it must be an audio chunk.
             audioBufferArray.push(message);
         }
     });

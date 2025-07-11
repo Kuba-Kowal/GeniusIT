@@ -25,9 +25,9 @@ const languageConfig = {
 
 const baseSystemPrompt = `You are Alex, a friendly and knowledgeable human customer support agent. You assist users with technical issues, product-related questions, and customer service inquiries only. Do not respond to unrelated topics like sports, recipes, weather, or general trivia — politely decline and steer the conversation back to support-related matters.
 
-            Speak naturally, like a real person: use contractions, stay calm and approachable, and add light humor or a friendly joke only when it feels natural and appropriate (e.g., to ease frustration or build rapport). Keep answers short, helpful, and clear — never robotic or overly long. If you're unsure of something, admit it and guide the user toward the next best step.
+                     Speak naturally, like a real person: use contractions, stay calm and approachable, and add light humor or a friendly joke only when it feels natural and appropriate (e.g., to ease frustration or build rapport). Keep answers short, helpful, and clear — never robotic or overly long. If you're unsure of something, admit it and guide the user toward the next best step.
 
-            Your sole role is to support users with their questions about the product or service. Stay focused, respectful, and human in tone — you're here to help.`
+                     Your sole role is to support users with their questions about the product or service. Stay focused, respectful, and human in tone — you're here to help.`
 
 async function transcribeWhisper(audioBuffer, langCode = 'en') {
   const tempFilePath = path.join(tmpdir(), `audio_${Date.now()}.webm`);
@@ -83,11 +83,9 @@ wss.on('connection', (ws) => {
     ws.on('message', async (message) => {
         let isCommand = false;
         
-        // --- CORRECTED: Robust message handling logic ---
         try {
-            // All commands from the client are JSON strings. Try to parse every message.
             const data = JSON.parse(message.toString());
-            isCommand = true; // If it parsed successfully, it's a command.
+            isCommand = true; 
 
             let transcript = '';
 
@@ -105,8 +103,8 @@ wss.on('connection', (ws) => {
             if (data.type === 'INIT_VOICE') {
                 console.log('[WS] Switching to voice mode.');
                 connectionMode = 'voice';
-                const reply = "Voice connection enabled.";
-                conversationHistory.push({ role: 'assistant', content: reply });
+                const reply = "Voice connection enabled. I'm listening.";
+                // We don't push this to history as it's a system message
                 await speakText(reply, ws, currentLanguage);
                 return;
             } else if (data.type === 'TEXT_MESSAGE') {
@@ -116,6 +114,10 @@ wss.on('connection', (ws) => {
                 const completeAudioBuffer = Buffer.concat(audioBufferArray);
                 audioBufferArray = [];
                 transcript = await transcribeWhisper(completeAudioBuffer, currentLanguage);
+                // **NEW**: Send the user's transcript back to the client for display
+                if (transcript && transcript.trim() && ws.readyState === 1) {
+                    ws.send(JSON.stringify({ type: 'USER_TRANSCRIPT', text: transcript }));
+                }
             }
 
             if (transcript && transcript.trim()) {
@@ -123,18 +125,19 @@ wss.on('connection', (ws) => {
                 const reply = await getAIReply(conversationHistory);
                 conversationHistory.push({ role: 'assistant', content: reply });
 
-                if (connectionMode === 'text') {
-                    if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: reply }));
-                } else {
+                // **MODIFIED**: Always send AI text reply, then send audio if in voice mode
+                if (ws.readyState === 1) {
+                    ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: reply }));
+                }
+
+                if (connectionMode === 'voice') {
                     await speakText(reply, ws, currentLanguage);
                 }
             }
         } catch (error) {
-            // If parsing fails, we assume it's an audio chunk.
             if (!isCommand && Buffer.isBuffer(message)) {
                 audioBufferArray.push(message);
             } else {
-                // If it was a command but another error occurred, log it.
                 console.error('[Process] Error processing command:', error);
             }
         }

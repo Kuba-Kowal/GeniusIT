@@ -10,6 +10,29 @@ dotenv.config();
 
 const app = express();
 app.use(express.json());
+
+// --- NEW: SECURE DOWNLOAD ENDPOINT ---
+// This allows you to download files from the 'recordings' directory.
+app.get('/recordings/:filename', (req, res) => {
+    // Sanitize the filename to prevent users from accessing other directories
+    const filename = path.basename(req.params.filename);
+    const recordingsDir = path.join(process.cwd(), 'recordings');
+    const filePath = path.join(recordingsDir, filename);
+
+    // Use res.download to send the file and prompt the browser to save it.
+    // It also handles cases where the file doesn't exist.
+    res.download(filePath, (err) => {
+        if (err) {
+            console.error('[Download] Error sending file:', err);
+            if (!res.headersSent) {
+                res.status(404).send('File not found.');
+            }
+        }
+    });
+});
+// --- END OF NEW CODE ---
+
+
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const ttsClient = new textToSpeech.TextToSpeechClient();
 const wss = new WebSocketServer({ noServer: true });
@@ -25,7 +48,6 @@ async function transcribeWhisper(audioBuffer) {
     const response = await openai.audio.transcriptions.create({
       file: fileStream,
       model: 'whisper-1',
-      // THIS LINE FORCES WHISPER TO USE ENGLISH
       language: 'en', 
     });
 
@@ -50,7 +72,7 @@ async function speakText(text, ws) {
     const audioContent = response.audioContent;
     console.log(`[TTS] Synthesized ${audioContent.length} bytes of MP3 audio.`);
 
-    if (ws.readyState === 1) { // 1 means OPEN
+    if (ws.readyState === 1) {
         ws.send(audioContent);
     }
     console.log('[TTS] Finished sending audio.');
@@ -81,6 +103,16 @@ wss.on('connection', (ws) => {
                     try {
                         const completeAudioBuffer = Buffer.concat(audioBufferArray);
                         audioBufferArray = [];
+
+                        try {
+                            const recordingsDir = path.join(process.cwd(), 'recordings');
+                            await fs.promises.mkdir(recordingsDir, { recursive: true });
+                            const savePath = path.join(recordingsDir, `recording-${Date.now()}.webm`);
+                            await fs.promises.writeFile(savePath, completeAudioBuffer);
+                            console.log(`[Debug] Audio successfully saved to: ${savePath}`);
+                        } catch (saveError) {
+                            console.error('[Debug] Failed to save audio file:', saveError);
+                        }
 
                         console.log(`[Process] Processing complete audio of ${completeAudioBuffer.length} bytes.`);
                         

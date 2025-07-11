@@ -11,21 +11,8 @@ dotenv.config();
 const app = express();
 app.use(express.json());
 
-app.get('/recordings/:filename', (req, res) => {
-    const filename = path.basename(req.params.filename);
-    const recordingsDir = path.join(process.cwd(), 'recordings');
-    const filePath = path.join(recordingsDir, filename);
-
-    res.download(filePath, (err) => {
-        if (err) {
-            console.error('[Download] Error sending file:', err);
-            if (!res.headersSent) {
-                res.status(404).send('File not found.');
-            }
-        }
-    });
-});
-
+// This endpoint is no longer needed as we removed the file saving logic.
+// app.get('/recordings/:filename', ...);
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const ttsClient = new textToSpeech.TextToSpeechClient();
@@ -79,6 +66,17 @@ wss.on('connection', (ws) => {
     console.log('[WS] New persistent connection established.');
     let audioBufferArray = [];
 
+    // --- NEW: INITIALIZE CONVERSATION HISTORY FOR THIS SESSION ---
+    let conversationHistory = [
+        {
+            role: 'system',
+            content: `You are a friendly, witty, and curious AI voice assistant. Your goal is to have a natural, back-and-forth conversation, not to give long lectures.
+            1. Keep your responses short and conversational.
+            2. If a user asks a broad question (like "tell me about football"), ask a clarifying question to get more details (e.g., "Sure, what about it interests you most?") instead of providing a long answer.
+            3. Use a touch of light humor where appropriate.`
+        }
+    ];
+
     ws.on('message', async (message) => {
         let isSignal = false;
         try {
@@ -98,8 +96,6 @@ wss.on('connection', (ws) => {
                         const completeAudioBuffer = Buffer.concat(audioBufferArray);
                         audioBufferArray = [];
 
-                        // The code for saving the audio file has been removed from here.
-
                         console.log(`[Process] Processing complete audio of ${completeAudioBuffer.length} bytes.`);
                         
                         const transcript = await transcribeWhisper(completeAudioBuffer);
@@ -107,26 +103,26 @@ wss.on('connection', (ws) => {
                         if (transcript && transcript.trim().length > 1) {
                             console.log(`[Process] Transcript: "${transcript}"`);
                             
-                            // --- NEW: SYSTEM PROMPT TO DEFINE AI PERSONALITY ---
+                            // --- CHANGED: ADD USER'S MESSAGE TO HISTORY ---
+                            conversationHistory.push({ role: 'user', content: transcript });
+                            
                             const chatCompletion = await openai.chat.completions.create({
                                 model: 'gpt-4o-mini',
-                                messages: [
-                                    {
-                                        role: 'system',
-                                        content: `You are a friendly, witty, and curious AI voice assistant. Your goal is to have a natural, back-and-forth conversation, not to give long lectures.
-                                        1. Keep your responses short and conversational.
-                                        2. If a user asks a broad question (like "tell me about football"), ask a clarifying question to get more details (e.g., "Sure, what about it interests you most?") instead of providing a long answer.
-                                        3. Use a touch of light humor where appropriate.`
-                                    },
-                                    {
-                                        role: 'user', 
-                                        content: transcript 
-                                    }
-                                ],
+                                // --- CHANGED: SEND THE ENTIRE HISTORY ---
+                                messages: conversationHistory,
                             });
-                            // --- END OF NEW CODE ---
-
+                            
                             const reply = chatCompletion.choices[0].message.content;
+
+                            // --- CHANGED: ADD AI'S RESPONSE TO HISTORY ---
+                            conversationHistory.push({ role: 'assistant', content: reply });
+
+                            // Optional: Trim history to prevent it from getting too long
+                            const maxHistoryTurns = 5; // 5 turns = 1 system, 5 user, 5 assistant msgs
+                            while (conversationHistory.length > (maxHistoryTurns * 2 + 1)) {
+                                conversationHistory.splice(1, 2); // Remove the oldest user/assistant pair
+                            }
+
                             console.log(`[Process] GPT reply: "${reply}"`);
                             await speakText(reply, ws);
                         } else {
@@ -152,11 +148,13 @@ wss.on('connection', (ws) => {
     ws.on('close', () => {
         console.log('[WS] Connection closed.');
         audioBufferArray = [];
+        conversationHistory = []; // Clear history on disconnect
     });
 
     ws.on('error', (err) => {
         console.error('[WS] Connection error:', err);
         audioBufferArray = [];
+        conversationHistory = []; // Clear history on error
     });
 });
 

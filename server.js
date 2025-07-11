@@ -25,6 +25,8 @@ async function transcribeWhisper(audioBuffer) {
     const response = await openai.audio.transcriptions.create({
       file: fileStream,
       model: 'whisper-1',
+      // Add a prompt to guide the AI and improve accuracy
+      prompt: 'This is a real-time conversation with a helpful AI assistant. The user might ask about various topics.'
     });
 
     console.log(`[Whisper] Transcription: "${response.text}"`);

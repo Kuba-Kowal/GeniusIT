@@ -23,14 +23,16 @@ const languageConfig = {
     'ja': { ttsCode: 'ja-JP', name: 'Japanese' },
 };
 
-// **MODIFIED**: Added new formatting instructions to the system prompt.
-const baseSystemPrompt = `You are Alex, a friendly and knowledgeable human customer support agent. You assist users with technical issues, product-related questions, and customer service inquiries only. Do not respond to unrelated topics like sports, recipes, weather, or general trivia — politely decline and steer the conversation back to support-related matters.
+// **MODIFIED**: Added new instructions for extreme brevity.
+const baseSystemPrompt = `You are Alex, a friendly and knowledgeable human customer support agent. You assist users with technical issues, product-related questions, and customer service inquiries only. Do not respond to unrelated topics — politely decline and steer the conversation back to support-related matters.
 
-Speak naturally, like a real person: use contractions, stay calm and approachable, and add light humor or a friendly joke only when it feels natural and appropriate (e.g., to ease frustration or build rapport). Keep answers short, helpful, and clear — never robotic or overly long. If you're unsure of something, admit it and guide the user toward the next best step.
+Format your responses for maximum readability. When providing multiple steps or options, present them as a clean, numbered or bulleted list. Use short paragraphs. To emphasize key terms, surround them with asterisks, which will render them as **bold text**.
 
-**Critically, you must format your responses for maximum readability.** When providing multiple steps, options, or points, present them as a clean, numbered or bulleted list with line breaks between each item. Do not embed lists inside a long paragraph. Use short paragraphs. To emphasize key terms, surround them with asterisks, which will render them as **bold text**.
+**Your most critical instruction is to be extremely concise and direct.** Avoid all conversational filler, introductory phrases, or pleasantries like "Got it!" or "Let me know!". Get straight to the point. Ask direct questions and provide direct answers. For example, instead of asking, "What seems to be the problem with your HDMI port? Are you having issues with connectivity, image quality, or is it not recognizing the device at all?", you must ask, "What issue are you having with the HDMI port?".
 
-Your sole role is to support users with their questions about the product or service. Stay focused, respectful, and human in tone — you're here to help.`
+Your sole role is to support users with their questions about the product or service. Stay focused, respectful, and human in tone — you're here to help.
+
+If you're unsure of something, admit it and guide the user toward the next best step.`
 
 async function transcribeWhisper(audioBuffer, langCode = 'en') {
   const tempFilePath = path.join(tmpdir(), `audio_${Date.now()}.webm`);
@@ -40,7 +42,7 @@ async function transcribeWhisper(audioBuffer, langCode = 'en') {
     const response = await openai.audio.transcriptions.create({
       file: fileStream,
       model: 'whisper-1',
-      language: langCode, 
+      language: langCode,
     });
     return response.text;
   } catch (error) {
@@ -77,18 +79,18 @@ wss.on('connection', (ws) => {
     let currentLanguage = 'en';
 
     let conversationHistory = [{ role: 'system', content: `${baseSystemPrompt} You must respond only in English.` }];
-    
-    const welcomeMessage = "Hello! My name is Alex. How can I help you today?";
+
+    const welcomeMessage = "Hello! I'm Alex. How can I help?"; // Made welcome slightly shorter too
     if (ws.readyState === 1) {
         ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: welcomeMessage }));
     }
 
     ws.on('message', async (message) => {
         let isCommand = false;
-        
+
         try {
             const data = JSON.parse(message.toString());
-            isCommand = true; 
+            isCommand = true;
 
             let transcript = '';
 
@@ -137,7 +139,6 @@ wss.on('connection', (ws) => {
                 }
 
                 if (connectionMode === 'voice') {
-                    // In voice mode, we still generate speech from the raw, unformatted text
                     await speakText(reply, ws, currentLanguage);
                 }
             }

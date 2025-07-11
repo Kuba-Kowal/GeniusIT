@@ -15,7 +15,6 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const ttsClient = new textToSpeech.TextToSpeechClient();
 const wss = new WebSocketServer({ noServer: true });
 
-// NEW: Language configuration map
 const languageConfig = {
     'en': { ttsCode: 'en-US', name: 'English' },
     'es': { ttsCode: 'es-ES', name: 'Spanish' },
@@ -24,7 +23,13 @@ const languageConfig = {
     'ja': { ttsCode: 'ja-JP', name: 'Japanese' },
 };
 
-const baseSystemPrompt = `You are Alex, a friendly and knowledgeable human customer support agent. You assist users with technical issues, product-related questions, and customer service inquiries only. Do not respond to unrelated topics like sports, recipes, weather, or general trivia — politely decline and steer the conversation back to support-related matters...`; // Your full prompt
+const baseSystemPrompt =             
+            role: 'system',
+            content: `You are Alex, a friendly and knowledgeable human customer support agent. You assist users with technical issues, product-related questions, and customer service inquiries only. Do not respond to unrelated topics like sports, recipes, weather, or general trivia — politely decline and steer the conversation back to support-related matters.
+
+            Speak naturally, like a real person: use contractions, stay calm and approachable, and add light humor or a friendly joke only when it feels natural and appropriate (e.g., to ease frustration or build rapport). Keep answers short, helpful, and clear — never robotic or overly long. If you're unsure of something, admit it and guide the user toward the next best step.
+
+            Your sole role is to support users with their questions about the product or service. Stay focused, respectful, and human in tone — you're here to help.`
 
 async function transcribeWhisper(audioBuffer, langCode = 'en') {
   const tempFilePath = path.join(tmpdir(), `audio_${Date.now()}.webm`);
@@ -68,7 +73,7 @@ wss.on('connection', (ws) => {
     console.log('[WS] New persistent connection established.');
     let audioBufferArray = [];
     let connectionMode = 'text';
-    let currentLanguage = 'en'; // Default language
+    let currentLanguage = 'en';
 
     let conversationHistory = [{ role: 'system', content: `${baseSystemPrompt} You must respond only in English.` }];
     
@@ -78,16 +83,16 @@ wss.on('connection', (ws) => {
     }
 
     ws.on('message', async (message) => {
+        let isCommand = false;
+        
+        // --- CORRECTED: Robust message handling logic ---
         try {
-            if (Buffer.isBuffer(message)) {
-                audioBufferArray.push(message);
-                return;
-            }
-
+            // All commands from the client are JSON strings. Try to parse every message.
             const data = JSON.parse(message.toString());
+            isCommand = true; // If it parsed successfully, it's a command.
+
             let transcript = '';
 
-            // NEW: Handle language change
             if (data.type === 'SET_LANGUAGE') {
                 const langCode = data.language;
                 if (languageConfig[langCode]) {
@@ -100,6 +105,7 @@ wss.on('connection', (ws) => {
             }
 
             if (data.type === 'INIT_VOICE') {
+                console.log('[WS] Switching to voice mode.');
                 connectionMode = 'voice';
                 const reply = "Voice connection enabled.";
                 conversationHistory.push({ role: 'assistant', content: reply });
@@ -126,7 +132,13 @@ wss.on('connection', (ws) => {
                 }
             }
         } catch (error) {
-            console.error('[Process] Error processing message:', error);
+            // If parsing fails, we assume it's an audio chunk.
+            if (!isCommand && Buffer.isBuffer(message)) {
+                audioBufferArray.push(message);
+            } else {
+                // If it was a command but another error occurred, log it.
+                console.error('[Process] Error processing command:', error);
+            }
         }
     });
 

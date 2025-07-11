@@ -60,35 +60,70 @@ async function speakText(text, ws) {
 }
 
 wss.on('connection', (ws) => {
-  console.log('[WS] New persistent connection established.');
+    console.log('[WS] New persistent connection established.');
+    let audioBufferArray = []; // Buffer to store incoming audio chunks for this connection
 
-  ws.on('message', async (message) => {
-    try {
-      const audioBuffer = Buffer.isBuffer(message) ? message : Buffer.from(message);
-      console.log(`[WS] Received audio message of ${audioBuffer.length} bytes.`);
-      
-      const transcript = await transcribeWhisper(audioBuffer);
-      
-      if (transcript && transcript.trim().length > 1) {
-        console.log(`[Process] Transcript: "${transcript}"`);
-        const chatCompletion = await openai.chat.completions.create({
-          model: 'gpt-4o-mini',
-          messages: [{ role: 'user', content: transcript }],
-        });
-        const reply = chatCompletion.choices[0].message.content;
-        console.log(`[Process] GPT reply: "${reply}"`);
-        await speakText(reply, ws);
-      } else {
-        console.log('[Process] Transcript empty, ignoring.');
-        // Optionally, send a message back to the client that nothing was heard
-        if (ws.readyState === 1) {
-          ws.send(JSON.stringify({ type: 'error', message: 'No speech detected.' }));
+    ws.on('message', async (message) => {
+        // Check if the message is the end-of-stream signal
+        if (typeof message === 'string') {
+            try {
+                const data = JSON.parse(message);
+                if (data.type === 'END_OF_STREAM') {
+                    console.log('[WS] End of stream signal received.');
+
+                    if (audioBufferArray.length === 0) {
+                        console.log('[Process] No audio data received before end of stream. Ignoring.');
+                        // Optionally send an error/info message back
+                        if (ws.readyState === 1) {
+                           ws.send(JSON.stringify({ type: 'error', message: 'No speech detected.' }));
+                        }
+                        return;
+                    }
+
+                    // Concatenate all received audio chunks into a single buffer
+                    const completeAudioBuffer = Buffer.concat(audioBufferArray);
+                    audioBufferArray = []; // Clear buffer for the next utterance
+
+                    console.log(`[Process] Processing complete audio of ${completeAudioBuffer.length} bytes.`);
+                    
+                    const transcript = await transcribeWhisper(completeAudioBuffer);
+                    
+                    if (transcript && transcript.trim().length > 1) {
+                        console.log(`[Process] Transcript: "${transcript}"`);
+                        const chatCompletion = await openai.chat.completions.create({
+                            model: 'gpt-4o-mini',
+                            messages: [{ role: 'user', content: transcript }],
+                        });
+                        const reply = chatCompletion.choices[0].message.content;
+                        console.log(`[Process] GPT reply: "${reply}"`);
+                        await speakText(reply, ws);
+                    } else {
+                        console.log('[Process] Transcript empty or too short, ignoring.');
+                        if (ws.readyState === 1) {
+                            ws.send(JSON.stringify({ type: 'error', message: 'Could not understand audio.' }));
+                        }
+                    }
+                }
+            } catch (e) {
+                // Not a JSON message, might be an error or unexpected text
+                console.log(`[WS] Received non-JSON text message: ${message}`);
+            }
+        } else if (Buffer.isBuffer(message)) {
+            // If it's a buffer, it's an audio chunk. Add it to our array.
+            audioBufferArray.push(message);
         }
-      }
-    } catch (error) {
-      console.error('[Process] Error processing message:', error);
-    }
-  });
+    });
+
+    ws.on('close', () => {
+        console.log('[WS] Connection closed.');
+        audioBufferArray = []; // Clean up resources
+    });
+
+    ws.on('error', (err) => {
+        console.error('[WS] Connection error:', err);
+        audioBufferArray = []; // Clean up resources
+    });
+});
 
   ws.on('close', () => console.log('[WS] Connection closed.'));
   ws.on('error', (err) => console.error('[WS] Connection error:', err));

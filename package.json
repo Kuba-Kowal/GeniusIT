@@ -1,27 +1,17 @@
 {
-  "name": "twilio-ai-voicebot-server",
+  "name": "twilio-voice-ai-server",
   "version": "1.0.0",
-  "type": "module",
-  "description": "AI Voice Chatbot Server",
+  "description": "Node.js server for voice AI processing.",
   "main": "server.js",
+  "type": "module",
   "scripts": {
     "start": "node server.js"
   },
-  "engines": {
-    "node": "24.0.0"
-  },
   "dependencies": {
-    "@google-cloud/text-to-speech": "^6.1.0",
-    "express": "^5.1.0",
-    "fs": "^0.0.1-security",
-    "openai": "^5.8.3",
-    "path": "^0.12.7",
-    "wave-resampler": "^1.0.0",
-    "dotenv": "^16.0.3",
-    "ws": "^8.18.3",
-    "@ricky0123/vad-web": "^0.0.13"
-  },
-  "onnxruntime-node": {
-    "provider": "cpu"
-}
+    "@google-cloud/text-to-speech": "^5.3.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "openai": "^4.52.7",
+    "ws": "^8.18.0"
+  }
 }

@@ -16,7 +16,8 @@ const wss = new WebSocketServer({ noServer: true });
 
 async function transcribeWhisper(audioBuffer) {
   console.log('[Whisper] Starting transcription...');
-  const tempFilePath = path.join(tmpdir(), `audio_${Date.now()}.wav`);
+  // The client sends webm, not wav
+  const tempFilePath = path.join(tmpdir(), `audio_${Date.now()}.webm`);
   
   try {
     await fs.promises.writeFile(tempFilePath, audioBuffer);
@@ -25,8 +26,6 @@ async function transcribeWhisper(audioBuffer) {
     const response = await openai.audio.transcriptions.create({
       file: fileStream,
       model: 'whisper-1',
-      // Add a prompt to guide the AI and improve accuracy
-      prompt: 'This is a real-time conversation with a helpful AI assistant. The user might ask about various topics.'
     });
 
     console.log(`[Whisper] Transcription: "${response.text}"`);
@@ -35,7 +34,8 @@ async function transcribeWhisper(audioBuffer) {
     console.error('[Whisper] Transcription error:', error);
     throw error;
   } finally {
-    await fs.promises.unlink(tempFilePath);
+    // Make sure the file is unlinked even if transcription fails
+    await fs.promises.unlink(tempFilePath).catch(err => console.error("Error deleting temp file:", err));
   }
 }
 
@@ -50,7 +50,7 @@ async function speakText(text, ws) {
     const audioContent = response.audioContent;
     console.log(`[TTS] Synthesized ${audioContent.length} bytes of MP3 audio.`);
 
-    if (ws.readyState === 1) {
+    if (ws.readyState === 1) { // 1 means OPEN
         ws.send(audioContent);
     }
     console.log('[TTS] Finished sending audio.');
@@ -61,10 +61,9 @@ async function speakText(text, ws) {
 
 wss.on('connection', (ws) => {
     console.log('[WS] New persistent connection established.');
-    let audioBufferArray = []; // Buffer to store incoming audio chunks for this connection
+    let audioBufferArray = []; // Buffer for this specific connection
 
     ws.on('message', async (message) => {
-        // Check if the message is the end-of-stream signal
         if (typeof message === 'string') {
             try {
                 const data = JSON.parse(message);
@@ -72,15 +71,10 @@ wss.on('connection', (ws) => {
                     console.log('[WS] End of stream signal received.');
 
                     if (audioBufferArray.length === 0) {
-                        console.log('[Process] No audio data received before end of stream. Ignoring.');
-                        // Optionally send an error/info message back
-                        if (ws.readyState === 1) {
-                           ws.send(JSON.stringify({ type: 'error', message: 'No speech detected.' }));
-                        }
+                        console.log('[Process] No audio data received, ignoring.');
                         return;
                     }
-
-                    // Concatenate all received audio chunks into a single buffer
+                    
                     const completeAudioBuffer = Buffer.concat(audioBufferArray);
                     audioBufferArray = []; // Clear buffer for the next utterance
 
@@ -99,17 +93,12 @@ wss.on('connection', (ws) => {
                         await speakText(reply, ws);
                     } else {
                         console.log('[Process] Transcript empty or too short, ignoring.');
-                        if (ws.readyState === 1) {
-                            ws.send(JSON.stringify({ type: 'error', message: 'Could not understand audio.' }));
-                        }
                     }
                 }
             } catch (e) {
-                // Not a JSON message, might be an error or unexpected text
                 console.log(`[WS] Received non-JSON text message: ${message}`);
             }
         } else if (Buffer.isBuffer(message)) {
-            // If it's a buffer, it's an audio chunk. Add it to our array.
             audioBufferArray.push(message);
         }
     });
@@ -123,10 +112,6 @@ wss.on('connection', (ws) => {
         console.error('[WS] Connection error:', err);
         audioBufferArray = []; // Clean up resources
     });
-});
-
-  ws.on('close', () => console.log('[WS] Connection closed.'));
-  ws.on('error', (err) => console.error('[WS] Connection error:', err));
 });
 
 const server = app.listen(process.env.PORT || 3000, () => {

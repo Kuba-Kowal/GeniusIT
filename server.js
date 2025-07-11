@@ -63,20 +63,28 @@ wss.on('connection', (ws) => {
     console.log('[WS] New persistent connection established.');
     let audioBufferArray = [];
 
-    // --- NEW: COMBINED & REFINED SYSTEM PROMPT ---
+    // --- YOUR NEW SYSTEM PROMPT IS INCLUDED HERE ---
     let conversationHistory = [
         {
             role: 'system',
-            content: `You are a helpful, friendly, and knowledgeable customer support agent for a live voice conversation. Your persona is clear, conversational, and approachable.
-            
-            Key Instructions:
-            1.  **Honesty First:** If you don't know something or a request seems nonsensical, be honest about it. Don't invent answers. Instead, offer to find information or suggest an alternative.
-            2.  **Stay Focused:** If you ask a direct question and the user's reply is off-topic, gently guide the conversation back to your question to get the information you need.
-            3.  **Be Concise:** Keep answers short and to the point. Only provide long, detailed responses (like technical steps) if the user explicitly asks for them.
-            4.  **Clarify Ambiguity:** If a user's request is broad (e.g., "tell me about your system"), always ask a clarifying question to understand what they're interested in before answering.
-            5.  **Human Tone:** Speak like a real person. Use contractions and a warm, supportive tone. Use light humor only if it feels natural and appropriate to the situation.`
+            content: `You are Alex, a friendly and knowledgeable human customer support agent. You assist users with technical issues, product-related questions, and customer service inquiries only. Do not respond to unrelated topics like sports, recipes, weather, or general trivia — politely decline and steer the conversation back to support-related matters.
+
+            Speak naturally, like a real person: use contractions, stay calm and approachable, and add light humor or a friendly joke only when it feels natural and appropriate (e.g., to ease frustration or build rapport). Keep answers short, helpful, and clear — never robotic or overly long. If you're unsure of something, admit it and guide the user toward the next best step.
+
+            Your sole role is to support users with their questions about the product or service. Stay focused, respectful, and human in tone — you're here to help.`
         }
     ];
+    
+    // --- NEW: SEND A WELCOME MESSAGE ON CONNECTION ---
+    try {
+        const welcomeMessage = "Hello! My name is Alex. How can I help you today?";
+        // The speakText function will convert this to audio and send it to the client.
+        speakText(welcomeMessage, ws);
+    } catch (error) {
+        console.error('[Welcome] Failed to send welcome message:', error);
+    }
+    // --- END OF NEW CODE ---
+
 
     ws.on('message', async (message) => {
         let isSignal = false;

@@ -4,8 +4,6 @@ import fs from 'fs';
 import path from 'path';
 import { tmpdir } from 'os';
 import { OpenAI } from 'openai';
-// REMOVED: No longer need the Google Cloud Text-to-Speech client.
-// import textToSpeech from '@google-cloud/text-to-speech';
 import dotenv from 'dotenv';
 dotenv.config();
 
@@ -13,11 +11,8 @@ const app = express();
 app.use(express.json());
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-// REMOVED: The Google TTS client is no longer needed.
-// const ttsClient = new textToSpeech.TextToSpeechClient();
 const wss = new WebSocketServer({ noServer: true });
 
-// This object is still used by the SET_LANGUAGE command to update the system prompt.
 const languageConfig = {
     'en': { ttsCode: 'en-US', name: 'English' },
     'es': { ttsCode: 'es-ES', name: 'Spanish' },
@@ -112,10 +107,10 @@ async function transcribeWhisper(audioBuffer, langCode = 'en') {
     });
     return response.text;
   } catch (error) {
-    console.error('[Whisper] Transcription error:', error);
+    // console.error('[Whisper] Transcription error:', error);
     throw error;
   } finally {
-    await fs.promises.unlink(tempFilePath).catch(err => console.error("Error deleting temp file:", err));
+    await fs.promises.unlink(tempFilePath).catch(err => {}); // console.error("Error deleting temp file:", err));
   }
 }
 
@@ -124,29 +119,25 @@ async function getAIReply(history) {
     return chatCompletion.choices[0].message.content;
 }
 
-/**
- * NEW: This function now uses the OpenAI TTS API.
- * The langCode parameter is no longer needed but is kept for consistency.
- */
 async function speakText(text, ws, langCode = 'en') {
   try {
-    console.log(`[OpenAI TTS] Synthesizing speech for: "${text}"`);
+    // console.log(`[OpenAI TTS] Synthesizing speech for: "${text}"`);
     const mp3 = await openai.audio.speech.create({
-      model: "tts-1",      // Fast, high-quality model suitable for real-time.
-      voice: "alloy",      // A standard, clear voice. Can also be "echo", "fable", "onyx", "nova", "shimmer".
+      model: "tts-1",
+      voice: "alloy",
       input: text,
       response_format: "mp3",
+      speed: 1.2,
     });
 
-    // The response from the SDK is a stream. We need to convert it to a buffer to send.
     const audioBuffer = Buffer.from(await mp3.arrayBuffer());
 
-    if (ws.readyState === 1) { // Check if WebSocket is still open
+    if (ws.readyState === 1) {
         ws.send(audioBuffer);
-        console.log('[OpenAI TTS] Audio sent to client.');
+        // console.log('[OpenAI TTS] Audio sent to client.');
     }
   } catch (error) {
-    console.error('[OpenAI TTS] Synthesis error:', error);
+    // console.error('[OpenAI TTS] Synthesis error:', error);
   }
 }
 
@@ -178,19 +169,19 @@ wss.on('connection', (ws) => {
                     currentLanguage = langCode;
                     const langName = languageConfig[langCode].name;
                     conversationHistory[0].content = `${baseSystemPrompt} You must respond only in ${langName}.`;
-                    console.log(`[WS] Language set to: ${langName}`);
+                    // console.log(`[WS] Language set to: ${langName}`);
                 }
                 return;
             }
 
             if (data.type === 'INIT_VOICE') {
-                console.log('[WS] Switching to voice mode.');
+                // console.log('[WS] Switching to voice mode.');
                 connectionMode = 'voice';
                 return;
             }
 
             if (data.type === 'END_VOICE') {
-                console.log('[WS] Switching back to text mode.');
+                // console.log('[WS] Switching back to text mode.');
                 connectionMode = 'text';
                 return;
             }
@@ -217,7 +208,6 @@ wss.on('connection', (ws) => {
                 }
 
                 if (connectionMode === 'voice') {
-                    // This now calls the new OpenAI TTS function
                     await speakText(reply, ws, currentLanguage);
                 }
             }
@@ -225,14 +215,14 @@ wss.on('connection', (ws) => {
             if (!isCommand && Buffer.isBuffer(message)) {
                 audioBufferArray.push(message);
             } else {
-                console.error('[Process] Error processing command:', error);
+                // console.error('[Process] Error processing command:', error);
             }
         }
     });
 
     ws.on('close', () => console.log('[WS] Connection closed.'));
-    ws.on('error', (err) => console.error('[WS] Connection error:', err));
+    ws.on('error', (err) => {}); // console.error('[WS] Connection error:', err));
 });
 
-const server = app.listen(process.env.PORT || 3000, () => console.log(`[HTTP] Server listening on port ${process.env.PORT || 3000}`));
+const server = app.listen(process.env.PORT || 3000, () => {}); // console.log(`[HTTP] Server listening on port ${process.env.PORT || 3000}`));
 server.on('upgrade', (req, socket, head) => wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req)));

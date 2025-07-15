@@ -167,13 +167,28 @@ const server = app.listen(port, () => console.log(`[HTTP] Server listening on po
 
 server.on('upgrade', (req, socket, head) => {
     const origin = req.headers.origin;
-    const allowedOrigins = process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : [];
-    if (allowedOrigins.includes(origin)) {
+
+    // Log what the server is seeing
+    console.log(`[Upgrade] Attempting upgrade from origin: ${origin}`);
+
+    // Get allowed origins from environment variable
+    const allowedOriginsRaw = process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : [];
+    
+    // Normalize origins for a more reliable comparison (removes trailing slashes)
+    const allowedOrigins = allowedOriginsRaw.map(o => o.trim().replace(/\/$/, ''));
+    const normalizedOrigin = origin ? origin.trim().replace(/\/$/, '') : '';
+
+    console.log(`[Upgrade] Normalized Origin: "${normalizedOrigin}". Allowed Origins: [${allowedOrigins.join(', ')}]`);
+
+    if (allowedOrigins.includes(normalizedOrigin)) {
+        // Origin is allowed, proceed with the WebSocket upgrade
+        console.log('[Upgrade] Origin approved. Handling upgrade.');
         wss.handleUpgrade(req, socket, head, (ws) => {
             wss.emit('connection', ws, req);
         });
     } else {
-        console.log(`[WS] Connection from origin ${origin} rejected.`);
+        // Origin is not allowed, destroy the socket to reject the connection
+        console.log(`[Upgrade] Origin rejected. Destroying socket.`);
         socket.destroy();
     }
 });

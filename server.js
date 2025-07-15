@@ -82,6 +82,17 @@ async function analyzeConversation(history) {
     }
 }
 
+// ** NEW **: Helper function to create a URL-friendly slug from a string
+function slugify(text) {
+  return text
+    .toString()
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, '-')           // Replace spaces with -
+    .replace(/[^\w\-]+/g, '')       // Remove all non-word chars
+    .replace(/\-\-+/g, '-');        // Replace multiple - with single -
+}
+
 async function logConversation(history, interactionType, origin, startTime) {
     if (!db) {
         console.log('[Firestore] Database not initialized. Skipping log.');
@@ -98,7 +109,13 @@ async function logConversation(history, interactionType, origin, startTime) {
             .map(msg => `[${msg.role}] ${msg.content}`)
             .join('\n---\n');
         
-        await db.collection('conversations').add({
+        // ** MODIFIED **: Create a unique, readable document ID
+        const date = new Date(startTime);
+        const timestamp = `${date.getFullYear()}${(date.getMonth()+1).toString().padStart(2, '0')}${date.getDate().toString().padStart(2, '0')}-${date.getHours().toString().padStart(2, '0')}${date.getMinutes().toString().padStart(2, '0')}`;
+        const subjectSlug = slugify(subject);
+        const docId = `${timestamp}-${subjectSlug}`;
+
+        const conversationData = {
             interaction_type: interactionType,
             origin: origin || 'unknown',
             start_time: startTime,
@@ -106,8 +123,12 @@ async function logConversation(history, interactionType, origin, startTime) {
             sentiment: sentiment,
             subject: subject,
             transcript: fullTranscript
-        });
-        console.log(`[Firestore] Logged conversation: "${subject}"`);
+        };
+
+        // ** MODIFIED **: Use .doc().set() instead of .add()
+        await db.collection('conversations').doc(docId).set(conversationData);
+        
+        console.log(`[Firestore] Logged conversation with ID: "${docId}"`);
     } catch (error) {
         console.error('[Firestore] Failed to log conversation:', error.message);
     }
@@ -153,6 +174,7 @@ wss.on('connection', (ws, req) => {
     let connectionMode = 'text';
     let currentLanguage = 'en';
     let conversationHistory = [];
+    let agentName = 'AI Support'; // Default name
     const origin = req.headers.origin;
     const startTime = new Date();
 
@@ -164,9 +186,9 @@ wss.on('connection', (ws, req) => {
             
             if (data.type === 'CONFIG') {
                 const configData = data.data.config || {};
+                agentName = configData.agent_name || 'Alex'; // Store agent name
                 const basePrompt = generateSystemPrompt(configData);
-                const agentName = configData.agent_name || 'Alex';
-                conversationHistory = [{ role: 'system', content: `${basePrompt} You must respond only in English.` }];
+                conversationHistory = [{ role: 'system', content: `${basePrompt}\nYour name is ${agentName}.` }];
                 const welcomeMessage = `Hi there! My name is ${agentName}. How can I help you today? 👋`;
                 if (ws.readyState === 1) {
                     ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: welcomeMessage }));
@@ -184,25 +206,17 @@ wss.on('connection', (ws, req) => {
 
             if (data.type === 'SET_LANGUAGE') {
                 const langCode = data.language;
-                if (languageConfig[langCode]) {
+                if (languageConfig[langCode] && conversationHistory.length > 0) {
                     currentLanguage = langCode;
                     const langName = languageConfig[langCode].name;
-                    if (conversationHistory.length > 0) {
-                        conversationHistory[0].content = conversationHistory[0].content.replace(/You must respond only in \w+\./, `You must respond only in ${langName}.`);
-                    }
+                    conversationHistory[0].content = conversationHistory[0].content.replace(/You must respond only in \w+\./, `You must respond only in ${langName}.`);
                     console.log(`[WS] Language set to: ${langName}`);
                 }
                 return;
             }
 
-            if (data.type === 'INIT_VOICE') {
-                connectionMode = 'voice';
-                return;
-            }
-            if (data.type === 'END_VOICE') {
-                connectionMode = 'text';
-                return;
-            }
+            if (data.type === 'INIT_VOICE') { connectionMode = 'voice'; return; }
+            if (data.type === 'END_VOICE') { connectionMode = 'text'; return; }
 
             if (data.type === 'TEXT_MESSAGE') {
                 transcript = data.text;
@@ -228,11 +242,8 @@ wss.on('connection', (ws, req) => {
                 }
             }
         } catch (error) {
-            if (!isCommand && Buffer.isBuffer(message)) {
-                audioBufferArray.push(message);
-            } else {
-                console.error('[Process] Error processing command:', error);
-            }
+            if (!isCommand && Buffer.isBuffer(message)) { audioBufferArray.push(message); } 
+            else { console.error('[Process] Error processing command:', error); }
         }
     });
 

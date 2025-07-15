@@ -95,32 +95,34 @@ wss.on('connection', (ws) => {
             // =================================================================
             // NEW: Main initialization logic
             // =================================================================
+            // Find and replace this entire block in server.js
             if (data.type === 'INIT_SESSION') {
                 console.log('[WS] Initializing session...');
-
+            
                 // Set language for the session
                 const langCode = data.language || 'en';
                 if (languageConfig[langCode]) {
                     currentLanguage = langCode;
-                    console.log(`[WS] Language set to: ${languageConfig[langCode].name}`);
+                    const langName = languageConfig[langCode].name;
+                    console.log(`[WS] Language set to: ${langName}`);
                 }
                 
                 // Set the dynamic persona from WordPress
                 const persona = data.persona || 'You are a helpful assistant.';
                 conversationHistory = [
-                    { role: 'system', content: `${persona} You must respond only in ${languageConfig[currentLanguage].name}.` },
-                    // Add a dummy user message to prompt the AI's greeting
-                    { role: 'user', content: 'GREETING' } 
+                    { role: 'system', content: `${persona} You must respond only in ${languageConfig[currentLanguage].name}.` }
                 ];
                 
-                // Get and send the AI's introductory message
-                const initialReply = await getAIReply(conversationHistory);
-                conversationHistory.push({ role: 'assistant', content: initialReply });
-                
+                // --- OPTIMIZATION ---
+                // Send an instant welcome message instead of waiting for the AI to generate one.
+                const welcomeMessage = "Hello! How can I help you today?";
                 if (ws.readyState === 1) {
-                    ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: initialReply }));
+                    ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: welcomeMessage }));
                 }
-                return; // End processing after initialization
+                // Add the instant message to the history so the AI knows what was already said.
+                conversationHistory.push({ role: 'assistant', content: welcomeMessage });
+                
+                return; // End processing. The AI is now ready for the user's first message.
             }
 
             if (data.type === 'INIT_VOICE') {

@@ -82,15 +82,14 @@ async function analyzeConversation(history) {
     }
 }
 
-// ** NEW **: Helper function to create a URL-friendly slug from a string
 function slugify(text) {
   return text
     .toString()
     .toLowerCase()
     .trim()
-    .replace(/\s+/g, '-')           // Replace spaces with -
-    .replace(/[^\w\-]+/g, '')       // Remove all non-word chars
-    .replace(/\-\-+/g, '-');        // Replace multiple - with single -
+    .replace(/\s+/g, '-')
+    .replace(/[^\w\-]+/g, '')
+    .replace(/\-\-+/g, '-');
 }
 
 async function logConversation(history, interactionType, origin, startTime) {
@@ -109,7 +108,6 @@ async function logConversation(history, interactionType, origin, startTime) {
             .map(msg => `[${msg.role}] ${msg.content}`)
             .join('\n---\n');
         
-        // ** MODIFIED **: Create a unique, readable document ID
         const date = new Date(startTime);
         const timestamp = `${date.getFullYear()}${(date.getMonth()+1).toString().padStart(2, '0')}${date.getDate().toString().padStart(2, '0')}-${date.getHours().toString().padStart(2, '0')}${date.getMinutes().toString().padStart(2, '0')}`;
         const subjectSlug = slugify(subject);
@@ -125,7 +123,6 @@ async function logConversation(history, interactionType, origin, startTime) {
             transcript: fullTranscript
         };
 
-        // ** MODIFIED **: Use .doc().set() instead of .add()
         await db.collection('conversations').doc(docId).set(conversationData);
         
         console.log(`[Firestore] Logged conversation with ID: "${docId}"`);
@@ -174,7 +171,7 @@ wss.on('connection', (ws, req) => {
     let connectionMode = 'text';
     let currentLanguage = 'en';
     let conversationHistory = [];
-    let agentName = 'AI Support'; // Default name
+    let agentName = 'AI Support';
     const origin = req.headers.origin;
     const startTime = new Date();
 
@@ -186,7 +183,7 @@ wss.on('connection', (ws, req) => {
             
             if (data.type === 'CONFIG') {
                 const configData = data.data.config || {};
-                agentName = configData.agent_name || 'Alex'; // Store agent name
+                agentName = configData.agent_name || 'Alex';
                 const basePrompt = generateSystemPrompt(configData);
                 conversationHistory = [{ role: 'system', content: `${basePrompt}\nYour name is ${agentName}.` }];
                 const welcomeMessage = `Hi there! My name is ${agentName}. How can I help you today? 👋`;

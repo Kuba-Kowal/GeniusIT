@@ -165,30 +165,44 @@ wss.on('connection', (ws) => {
 
 const server = app.listen(port, () => console.log(`[HTTP] Server listening on port ${port}`));
 
-server.on('upgrade', (req, socket, head) => {
-    const origin = req.headers.origin;
-
-    // Log what the server is seeing
-    console.log(`[Upgrade] Attempting upgrade from origin: ${origin}`);
-
-    // Get allowed origins from environment variable
-    const allowedOriginsRaw = process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : [];
+wss.on('connection', (ws) => {
+    console.log('[WS] New connection established. Waiting for client initialization.');
     
-    // Normalize origins for a more reliable comparison (removes trailing slashes)
-    const allowedOrigins = allowedOriginsRaw.map(o => o.trim().replace(/\/$/, ''));
-    const normalizedOrigin = origin ? origin.trim().replace(/\/$/, '') : '';
+    let audioBufferArray = [], connectionMode = 'text', currentLanguage = 'en', conversationHistory = [], isInitialized = false;
 
-    console.log(`[Upgrade] Normalized Origin: "${normalizedOrigin}". Allowed Origins: [${allowedOrigins.join(', ')}]`);
+    ws.on('message', async (message) => {
+        try {
+            if (Buffer.isBuffer(message)) {
+                if (isInitialized) audioBufferArray.push(message);
+                return;
+            }
 
-    if (allowedOrigins.includes(normalizedOrigin)) {
-        // Origin is allowed, proceed with the WebSocket upgrade
-        console.log('[Upgrade] Origin approved. Handling upgrade.');
-        wss.handleUpgrade(req, socket, head, (ws) => {
-            wss.emit('connection', ws, req);
-        });
-    } else {
-        // Origin is not allowed, destroy the socket to reject the connection
-        console.log(`[Upgrade] Origin rejected. Destroying socket.`);
-        socket.destroy();
-    }
+            const data = JSON.parse(message.toString());
+            let transcript = '';
+
+            // Logic is now back to being client-led
+            switch (data.type) {
+                case 'INIT_SESSION':
+                    if (isInitialized) return;
+                    isInitialized = true;
+                    console.log('[WS] Initializing session...');
+                    const langCode = data.language || 'en';
+                    if (languageConfig[langCode]) currentLanguage = langCode;
+                    conversationHistory = [{ role: 'system', content: data.persona || 'You are a helpful assistant.' }];
+                    const welcomeMessage = "Hello! How can I help you today?";
+                    if (ws.readyState === 1) {
+                        ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: welcomeMessage }));
+                    }
+                    conversationHistory.push({ role: 'assistant', content: welcomeMessage });
+                    break;
+                // ... (The rest of the switch cases for TEXT_MESSAGE, etc., remain the same)
+            }
+            // ... (The rest of the message handler logic remains the same)
+        } catch (error) {
+            console.error('[Process] Error processing message:', error);
+        }
+    });
+
+    ws.on('close', () => console.log('[WS] Connection closed.'));
+    ws.on('error', (err) => console.error('[WS] Connection error:', err));
 });

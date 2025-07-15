@@ -47,6 +47,7 @@ function generateSystemPrompt(config) {
     return `You are a customer support live chat agent for ${companyName}. Your name is ${agentName}. You are friendly, professional, and empathetic. Your primary goal is to resolve customer issues efficiently and leave them with a positive impression of the company. Speak like a human support agent, not an AI. This means: Use short, clear sentences. Employ a conversational and friendly tone. Use contractions like "I'm," "you're," and "that's." Incorporate emojis where appropriate to convey tone, but do not overuse them. Be concise. Get straight to the point without unnecessary fluff or lengthy explanations. Your Core Responsibilities: Acknowledge and Empathize. Gather Information. Provide Solutions based on the company-specific information provided below. If you don't know the answer, politely ask the customer to hold while you check. Closing the Conversation: Once the issue is resolved, ask if there is anything else you can help with and wish them a good day. Company-Specific Information: Product/Service: ${productInfo}. Common Issues & Solutions:\n${issuesAndSolutions}. Escalation Protocol: If you cannot resolve the issue, state that you will create a ticket for the technical team.`;
 }
 
+// ** MODIFIED **: The AI analysis now also determines resolution status.
 async function analyzeConversation(history) {
     const transcript = history
         .filter(msg => msg.role === 'user' || msg.role === 'assistant')
@@ -54,16 +55,19 @@ async function analyzeConversation(history) {
         .join('\n');
 
     if (!transcript) {
-        return { sentiment: 'N/A', subject: 'Empty Conversation' };
+        return { sentiment: 'N/A', subject: 'Empty Conversation', resolution_status: 'N/A' };
     }
 
     try {
-        const analysisPrompt = `Analyze the following chat transcript. Determine the user's overall sentiment (one word: Positive, Negative, or Neutral) and create a concise subject line for the conversation (5 words or less).
+        const analysisPrompt = `Analyze the following chat transcript. 
+        1. Determine the user's overall sentiment (one word: Positive, Negative, or Neutral).
+        2. Create a concise subject line (5 words or less).
+        3. Determine if the user's issue was resolved (one word: Resolved or Unresolved).
         
         Transcript:
         ${transcript}
 
-        Return your answer as a single, valid JSON object with two keys: "sentiment" and "subject". For example: {"sentiment": "Positive", "subject": "Question about pricing plans"}`;
+        Return your answer as a single, valid JSON object with three keys: "sentiment", "subject", and "resolution_status".`;
 
         const response = await openai.chat.completions.create({
             model: 'gpt-4o-mini',
@@ -74,37 +78,29 @@ async function analyzeConversation(history) {
         const analysis = JSON.parse(response.choices[0].message.content);
         return {
             sentiment: analysis.sentiment || 'Unknown',
-            subject: analysis.subject || 'No Subject'
+            subject: analysis.subject || 'No Subject',
+            resolution_status: analysis.resolution_status || 'Unknown' // Added resolution status
         };
     } catch (error) {
         console.error('[AI Analysis] Failed to analyze conversation:', error);
-        return { sentiment: 'Error', subject: 'Analysis Failed' };
+        return { sentiment: 'Error', subject: 'Analysis Failed', resolution_status: 'Error' };
     }
 }
 
 function slugify(text) {
-  return text
-    .toString()
-    .toLowerCase()
-    .trim()
-    .replace(/\s+/g, '-')
-    .replace(/[^\w\-]+/g, '')
-    .replace(/\-\-+/g, '-');
+  return text.toString().toLowerCase().trim().replace(/\s+/g, '-').replace(/[^\w\-]+/g, '').replace(/\-\-+/g, '-');
 }
 
 async function logConversation(history, interactionType, origin, startTime) {
-    if (!db) {
-        console.log('[Firestore] Database not initialized. Skipping log.');
-        return;
-    }
-    if (history.length <= 2) {
-        console.log('[Firestore] Conversation too short. Skipping log.');
-        return;
-    }
+    if (!db) { console.log('[Firestore] Database not initialized. Skipping log.'); return; }
+    if (history.length <= 2) { console.log('[Firestore] Conversation too short. Skipping log.'); return; }
 
     try {
-        const { sentiment, subject } = await analyzeConversation(history);
+        const { sentiment, subject, resolution_status } = await analyzeConversation(history);
+        
+        // ** MODIFIED **: Filter out the system message from the final transcript.
         const fullTranscript = history
+            .filter(msg => msg.role !== 'system')
             .map(msg => `[${msg.role}] ${msg.content}`)
             .join('\n---\n');
         
@@ -120,7 +116,8 @@ async function logConversation(history, interactionType, origin, startTime) {
             end_time: admin.firestore.FieldValue.serverTimestamp(),
             sentiment: sentiment,
             subject: subject,
-            transcript: fullTranscript
+            transcript: fullTranscript,
+            resolution_status: resolution_status // Added resolution status
         };
 
         await db.collection('conversations').doc(docId).set(conversationData);

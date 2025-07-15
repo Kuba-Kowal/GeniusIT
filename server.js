@@ -53,7 +53,6 @@ async function getAIReply(history) {
         console.log('[OpenAI] Successfully received reply.');
         return reply;
     } catch (error) {
-        // This will log the specific error if the API call fails
         console.error('[OpenAI] API call failed:', error);
         return 'I apologize, but I encountered an error trying to connect to my brain. Please try again.';
     }
@@ -87,70 +86,76 @@ wss.on('connection', (ws) => {
     }
 
     ws.on('message', async (message) => {
-        let isCommand = false;
         try {
             if (Buffer.isBuffer(message)) {
-                audioBufferArray.push(message);
+                if (isInitialized) {
+                    audioBufferArray.push(message);
+                }
                 return;
             }
 
             const data = JSON.parse(message.toString());
-            isCommand = true;
             let transcript = '';
 
-            if (data.type === 'INIT_SESSION' && !isInitialized) {
-                isInitialized = true;
-                console.log('[WS] Initializing session...');
+            switch (data.type) {
+                case 'INIT_SESSION':
+                    if (isInitialized) return;
+                    isInitialized = true;
+                    console.log('[WS] Initializing session...');
 
-                const langCode = data.language || 'en';
-                if (languageConfig[langCode]) {
-                    currentLanguage = langCode;
-                    console.log(`[WS] Language set to: ${languageConfig[langCode].name}`);
-                }
-                
-                const persona = data.persona || 'You are a helpful assistant.';
-                conversationHistory = [
-                    { role: 'system', content: `${persona} You must respond only in ${languageConfig[currentLanguage].name}.` }
-                ];
-                
-                const welcomeMessage = "Hello! How can I help you today?";
-                if (ws.readyState === 1) {
-                    ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: welcomeMessage }));
-                }
-                conversationHistory.push({ role: 'assistant', content: welcomeMessage });
-                
-                return;
-            }
+                    const langCode = data.language || 'en';
+                    if (languageConfig[langCode]) {
+                        currentLanguage = langCode;
+                        console.log(`[WS] Language set to: ${languageConfig[langCode].name}`);
+                    }
+                    
+                    const persona = data.persona || 'You are a helpful assistant.';
+                    conversationHistory = [
+                        { role: 'system', content: `${persona} You must respond only in ${languageConfig[currentLanguage].name}.` }
+                    ];
+                    
+                    const welcomeMessage = "Hello! How can I help you today?";
+                    if (ws.readyState === 1) {
+                        ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: welcomeMessage }));
+                    }
+                    conversationHistory.push({ role: 'assistant', content: welcomeMessage });
+                    break;
 
-            if (!isInitialized) return; // Ignore messages until initialized
+                case 'TEXT_MESSAGE':
+                    if (!isInitialized) return;
+                    transcript = data.text;
+                    break;
 
-            if (data.type === 'INIT_VOICE') {
-                console.log('[WS] Switching to voice mode.');
-                connectionMode = 'voice';
-                return;
-            }
+                case 'END_OF_STREAM':
+                    if (!isInitialized || audioBufferArray.length === 0) return;
+                    const completeAudioBuffer = Buffer.concat(audioBufferArray);
+                    audioBufferArray = [];
+                    transcript = await transcribeWhisper(completeAudioBuffer, currentLanguage);
+                    if (transcript && transcript.trim() && ws.readyState === 1) {
+                        ws.send(JSON.stringify({ type: 'USER_TRANSCRIPT', text: transcript }));
+                    }
+                    break;
+                    
+                case 'INIT_VOICE':
+                    if (isInitialized) {
+                        console.log('[WS] Switching to voice mode.');
+                        connectionMode = 'voice';
+                    }
+                    break;
 
-            if (data.type === 'END_VOICE') {
-                console.log('[WS] Switching back to text mode.');
-                connectionMode = 'text';
-                return;
-            }
-
-            if (data.type === 'TEXT_MESSAGE') {
-                transcript = data.text;
-            } else if (data.type === 'END_OF_STREAM') {
-                if (audioBufferArray.length === 0) return;
-                const completeAudioBuffer = Buffer.concat(audioBufferArray);
-                audioBufferArray = [];
-                transcript = await transcribeWhisper(completeAudioBuffer, currentLanguage);
-                if (transcript && transcript.trim() && ws.readyState === 1) {
-                    ws.send(JSON.stringify({ type: 'USER_TRANSCRIPT', text: transcript }));
-                }
+                case 'END_VOICE':
+                    if (isInitialized) {
+                        console.log('[WS] Switching back to text mode.');
+                        connectionMode = 'text';
+                    }
+                    break;
             }
 
             if (transcript && transcript.trim()) {
                 conversationHistory.push({ role: 'user', content: transcript });
+                
                 const reply = await getAIReply(conversationHistory);
+
                 conversationHistory.push({ role: 'assistant', content: reply });
 
                 if (ws.readyState === 1) {
@@ -162,11 +167,7 @@ wss.on('connection', (ws) => {
                 }
             }
         } catch (error) {
-            if (!isCommand) {
-                console.error('[Process] Received non-buffer, non-JSON message:', message.toString());
-            } else {
-                console.error('[Process] Error processing command:', error);
-            }
+            console.error('[Process] Error processing message:', error);
         }
     });
 

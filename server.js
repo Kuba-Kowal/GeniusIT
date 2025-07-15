@@ -11,6 +11,22 @@ dotenv.config();
 const app = express();
 app.use(express.json());
 
+// Add this entire block for testing the OpenAI API connection
+app.get('/test-openai', async (req, res) => {
+    console.log('[Test] Attempting OpenAI test...');
+    try {
+        const response = await openai.chat.completions.create({
+            model: 'gpt-4o-mini',
+            messages: [{ role: 'user', content: 'Hello' }],
+        });
+        console.log('[Test] OpenAI API test successful!');
+        res.send('OpenAI API test successful!');
+    } catch (error) {
+        console.error('[Test] OpenAI API test failed:', error);
+        res.status(500).send('OpenAI API test failed. Check server logs.');
+    }
+});
+
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const ttsClient = new textToSpeech.TextToSpeechClient();
 const wss = new WebSocketServer({ noServer: true });

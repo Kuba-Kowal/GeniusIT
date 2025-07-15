@@ -11,25 +11,37 @@ dotenv.config();
 const app = express();
 app.use(express.json());
 
-// Add this entire block for testing the OpenAI API connection
-app.get('/test-openai', async (req, res) => {
-    console.log('[Test] Attempting OpenAI test...');
-    try {
-        const response = await openai.chat.completions.create({
-            model: 'gpt-4o-mini',
-            messages: [{ role: 'user', content: 'Hello' }],
-        });
-        console.log('[Test] OpenAI API test successful!');
-        res.send('OpenAI API test successful!');
-    } catch (error) {
-        console.error('[Test] OpenAI API test failed:', error);
-        res.status(500).send('OpenAI API test failed. Check server logs.');
-    }
-});
-
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const ttsClient = new textToSpeech.TextToSpeechClient();
 const wss = new WebSocketServer({ noServer: true });
+
+// --- START: JOB QUEUE IMPLEMENTATION ---
+const jobQueue = [];
+let isWorkerRunning = false;
+
+async function processJobQueue() {
+    if (isWorkerRunning) return;
+    isWorkerRunning = true;
+
+    while (jobQueue.length > 0) {
+        const job = jobQueue.shift(); // Get the next job
+        try {
+            const reply = await getAIReply(job.conversationHistory);
+            job.conversationHistory.push({ role: 'assistant', content: reply });
+
+            if (job.ws.readyState === 1) {
+                job.ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: reply }));
+                if (job.connectionMode === 'voice') {
+                    await speakText(reply, job.ws, job.currentLanguage);
+                }
+            }
+        } catch (error) {
+            console.error('[Worker] Error processing job:', error);
+        }
+    }
+    isWorkerRunning = false;
+}
+// --- END: JOB QUEUE IMPLEMENTATION ---
 
 const languageConfig = {
     'en': { ttsCode: 'en-US', name: 'English' },
@@ -44,11 +56,7 @@ async function transcribeWhisper(audioBuffer, langCode = 'en') {
   try {
     await fs.promises.writeFile(tempFilePath, audioBuffer);
     const fileStream = fs.createReadStream(tempFilePath);
-    const response = await openai.audio.transcriptions.create({
-      file: fileStream,
-      model: 'whisper-1',
-      language: langCode,
-    });
+    const response = await openai.audio.transcriptions.create({ file: fileStream, model: 'whisper-1', language: langCode });
     return response.text;
   } catch (error) {
     console.error('[Whisper] Transcription error:', error);
@@ -61,16 +69,13 @@ async function transcribeWhisper(audioBuffer, langCode = 'en') {
 async function getAIReply(history) {
     console.log('[OpenAI] Attempting to get AI reply...');
     try {
-        const chatCompletion = await openai.chat.completions.create({ 
-            model: 'gpt-4o-mini', 
-            messages: history 
-        });
+        const chatCompletion = await openai.chat.completions.create({ model: 'gpt-4o-mini', messages: history });
         const reply = chatCompletion.choices[0].message.content;
         console.log('[OpenAI] Successfully received reply.');
         return reply;
     } catch (error) {
         console.error('[OpenAI] API call failed:', error);
-        return 'I apologize, but I encountered an error trying to connect to my brain. Please try again.';
+        return 'I apologize, but I encountered an error. Please try again.';
     }
 }
 
@@ -88,6 +93,19 @@ async function speakText(text, ws, langCode = 'en') {
   }
 }
 
+// Test endpoint (can be removed in production)
+app.get('/test-openai', async (req, res) => {
+    console.log('[Test] Attempting OpenAI test...');
+    try {
+        const response = await openai.chat.completions.create({ model: 'gpt-4o-mini', messages: [{ role: 'user', content: 'Hello' }] });
+        console.log('[Test] OpenAI API test successful!');
+        res.send('OpenAI API test successful!');
+    } catch (error) {
+        console.error('[Test] OpenAI API test failed:', error);
+        res.status(500).send('OpenAI API test failed. Check server logs.');
+    }
+});
+
 wss.on('connection', (ws) => {
     console.log('[WS] New connection established. Requesting initialization.');
     
@@ -104,9 +122,7 @@ wss.on('connection', (ws) => {
     ws.on('message', async (message) => {
         try {
             if (Buffer.isBuffer(message)) {
-                if (isInitialized) {
-                    audioBufferArray.push(message);
-                }
+                if (isInitialized) audioBufferArray.push(message);
                 return;
             }
 
@@ -118,30 +134,23 @@ wss.on('connection', (ws) => {
                     if (isInitialized) return;
                     isInitialized = true;
                     console.log('[WS] Initializing session...');
-
                     const langCode = data.language || 'en';
                     if (languageConfig[langCode]) {
                         currentLanguage = langCode;
                         console.log(`[WS] Language set to: ${languageConfig[langCode].name}`);
                     }
-                    
                     const persona = data.persona || 'You are a helpful assistant.';
-                    conversationHistory = [
-                        { role: 'system', content: `${persona} You must respond only in ${languageConfig[currentLanguage].name}.` }
-                    ];
-                    
+                    conversationHistory = [{ role: 'system', content: `${persona} You must respond only in ${languageConfig[currentLanguage].name}.` }];
                     const welcomeMessage = "Hello! How can I help you today?";
                     if (ws.readyState === 1) {
                         ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: welcomeMessage }));
                     }
                     conversationHistory.push({ role: 'assistant', content: welcomeMessage });
                     break;
-
                 case 'TEXT_MESSAGE':
                     if (!isInitialized) return;
                     transcript = data.text;
                     break;
-
                 case 'END_OF_STREAM':
                     if (!isInitialized || audioBufferArray.length === 0) return;
                     const completeAudioBuffer = Buffer.concat(audioBufferArray);
@@ -151,36 +160,19 @@ wss.on('connection', (ws) => {
                         ws.send(JSON.stringify({ type: 'USER_TRANSCRIPT', text: transcript }));
                     }
                     break;
-                    
                 case 'INIT_VOICE':
-                    if (isInitialized) {
-                        console.log('[WS] Switching to voice mode.');
-                        connectionMode = 'voice';
-                    }
+                    if (isInitialized) connectionMode = 'voice';
                     break;
-
                 case 'END_VOICE':
-                    if (isInitialized) {
-                        console.log('[WS] Switching back to text mode.');
-                        connectionMode = 'text';
-                    }
+                    if (isInitialized) connectionMode = 'text';
                     break;
             }
 
             if (transcript && transcript.trim()) {
                 conversationHistory.push({ role: 'user', content: transcript });
-                
-                const reply = await getAIReply(conversationHistory);
-
-                conversationHistory.push({ role: 'assistant', content: reply });
-
-                if (ws.readyState === 1) {
-                    ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: reply }));
-                }
-
-                if (connectionMode === 'voice') {
-                    await speakText(reply, ws, currentLanguage);
-                }
+                // MODIFIED: Add a job to the queue instead of awaiting here
+                jobQueue.push({ ws, conversationHistory, connectionMode, currentLanguage });
+                processJobQueue(); // Start the worker
             }
         } catch (error) {
             console.error('[Process] Error processing message:', error);
@@ -197,7 +189,6 @@ const server = app.listen(port, () => console.log(`[HTTP] Server listening on po
 server.on('upgrade', (req, socket, head) => {
     const origin = req.headers.origin;
     const allowedOrigins = process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : [];
-
     if (allowedOrigins.includes(origin)) {
         wss.handleUpgrade(req, socket, head, (ws) => {
             wss.emit('connection', ws, req);

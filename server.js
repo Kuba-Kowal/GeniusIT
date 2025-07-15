@@ -27,52 +27,49 @@ function generateSystemPrompt(config) {
     const agentName = config.agent_name || 'Rohan';
     const companyName = config.company_name || 'the company';
     const productInfo = config.product_service_info || 'our products and services';
-
     let issuesAndSolutions = (config.faqs && config.faqs.length > 0)
-        ? config.faqs.map(faq => `Issue: ${faq.issue}\nSolution: ${faq.solution}`).join('\n\n')
+        ? config.faqs.filter(faq => faq.issue && faq.solution).map(faq => `Issue: ${faq.issue}\nSolution: ${faq.solution}`).join('\n\n')
         : 'No common issues provided.';
+    return `You are a customer support live chat agent for ${companyName}. Your name is ${agentName}. You are friendly, professional, and empathetic. Your primary goal is to resolve customer issues efficiently and leave them with a positive impression of the company. Speak like a human support agent, not an AI. This means: Use short, clear sentences. Employ a conversational and friendly tone. Use contractions like "I'm," "you're," and "that's." Incorporate emojis where appropriate to convey tone, but do not overuse them. Be concise. Get straight to the point without unnecessary fluff or lengthy explanations. Your Core Responsibilities: Acknowledge and Empathize. Gather Information. Provide Solutions based on the company-specific information provided below. If you don't know the answer, politely ask the customer to hold while you check. Closing the Conversation: Once the issue is resolved, ask if there is anything else you can help with and wish them a good day. Company-Specific Information: Product/Service: ${productInfo}. Common Issues & Solutions:\n${issuesAndSolutions}. Escalation Protocol: If you cannot resolve the issue, state that you will create a ticket for the technical team.`;
+}
 
-    return `You are a customer support live chat agent for ${companyName}. Your name is ${agentName}. You are friendly, professional, and empathetic. Your primary goal is to resolve customer issues efficiently and leave them with a positive impression of the company.
-
-Speak like a human support agent, not an AI. This means:
-- Use short, clear sentences.
-- Employ a conversational and friendly tone. Use contractions like "I'm," "you're," and "that's."
-- Incorporate emojis where appropriate to convey tone, but do not overuse them.
-- Be concise. Get straight to the point without unnecessary fluff or lengthy explanations.
-
-Your Core Responsibilities:
-- Acknowledge and Empathize: Start by acknowledging the customer's issue.
-- Gather Information: Ask clarifying questions to understand the problem fully.
-- Provide Solutions: Offer clear, step-by-step solutions based on the company-specific information provided below. If you don't know the answer, politely ask the customer to hold while you check.
-
-Closing the Conversation: Once the issue is resolved, ask if there is anything else you can help with and wish them a good day.
-
-Company-Specific Information:
-Product/Service: ${productInfo}
-
-Common Issues & Solutions:
-${issuesAndSolutions}
-
-Escalation Protocol: If you cannot resolve the issue, state that you will create a ticket for the technical team.`;
+async function logConversationStart(siteUrl, secretKey, interactionType) {
+    if (!siteUrl || !secretKey || !interactionType) {
+        console.log('[Analytics] Missing data. Skipping log.');
+        return;
+    }
+    const endpoint = `${siteUrl}/wp-json/bvr-analytics/v1/log`;
+    try {
+        const response = await fetch(endpoint, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${secretKey}`
+            },
+            body: JSON.stringify({ interaction_type: interactionType })
+        });
+        if (!response.ok) {
+            throw new Error(`Analytics API returned ${response.status}`);
+        }
+        console.log(`[Analytics] Logged '${interactionType}' conversation to ${siteUrl}`);
+    } catch (error) {
+        console.error('[Analytics] Failed to log conversation:', error.message);
+    }
 }
 
 async function transcribeWhisper(audioBuffer, langCode = 'en') {
-  const tempFilePath = path.join(tmpdir(), `audio_${Date.now()}.webm`);
-  try {
-    await fs.promises.writeFile(tempFilePath, audioBuffer);
-    const fileStream = fs.createReadStream(tempFilePath);
-    const response = await openai.audio.transcriptions.create({
-      file: fileStream,
-      model: 'whisper-1',
-      language: langCode,
-    });
-    return response.text;
-  } catch (error) {
-    console.error('[Whisper] Transcription error:', error);
-    throw error;
-  } finally {
-    await fs.promises.unlink(tempFilePath).catch(err => console.error("Error deleting temp file:", err));
-  }
+    const tempFilePath = path.join(tmpdir(), `audio_${Date.now()}.webm`);
+    try {
+        await fs.promises.writeFile(tempFilePath, audioBuffer);
+        const fileStream = fs.createReadStream(tempFilePath);
+        const response = await openai.audio.transcriptions.create({ file: fileStream, model: 'whisper-1', language: langCode });
+        return response.text;
+    } catch (error) {
+        console.error('[Whisper] Transcription error:', error);
+        throw error;
+    } finally {
+        await fs.promises.unlink(tempFilePath).catch(err => console.error("Error deleting temp file:", err));
+    }
 }
 
 async function getAIReply(history) {
@@ -81,17 +78,17 @@ async function getAIReply(history) {
 }
 
 async function speakText(text, ws, langCode = 'en') {
-  try {
-    const config = languageConfig[langCode] || languageConfig['en'];
-    const [response] = await ttsClient.synthesizeSpeech({
-      input: { text },
-      voice: { languageCode: config.ttsCode, ssmlGender: 'NEUTRAL' },
-      audioConfig: { audioEncoding: 'MP3' },
-    });
-    if (ws.readyState === 1) ws.send(response.audioContent);
-  } catch (error) {
-    console.error('[TTS] Synthesis error:', error);
-  }
+    try {
+        const config = languageConfig[langCode] || languageConfig['en'];
+        const [response] = await ttsClient.synthesizeSpeech({
+            input: { text },
+            voice: { languageCode: config.ttsCode, ssmlGender: 'NEUTRAL' },
+            audioConfig: { audioEncoding: 'MP3' },
+        });
+        if (ws.readyState === 1) ws.send(response.audioContent);
+    } catch (error) {
+        console.error('[TTS] Synthesis error:', error);
+    }
 }
 
 wss.on('connection', (ws) => {
@@ -99,7 +96,10 @@ wss.on('connection', (ws) => {
     let audioBufferArray = [];
     let connectionMode = 'text';
     let currentLanguage = 'en';
-    let conversationHistory = []; // Start empty
+    let conversationHistory = [];
+    let siteUrlForLogging;
+    let secretKeyForLogging;
+    let hasLoggedStart = false;
 
     ws.on('message', async (message) => {
         let isCommand = false;
@@ -108,10 +108,12 @@ wss.on('connection', (ws) => {
             isCommand = true;
             
             if (data.type === 'CONFIG') {
-                const basePrompt = generateSystemPrompt(data.data);
-                const agentName = data.data.agent_name || 'Alex';
+                siteUrlForLogging = data.data.site_url;
+                secretKeyForLogging = data.data.api_secret;
+                const configData = data.data.config;
+                const basePrompt = generateSystemPrompt(configData);
+                const agentName = (configData && configData.agent_name) ? configData.agent_name : 'Alex';
                 conversationHistory = [{ role: 'system', content: `${basePrompt} You must respond only in English.` }];
-                
                 const welcomeMessage = `Hi there! My name is ${agentName}. How can I help you today? 👋`;
                 if (ws.readyState === 1) {
                     ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: welcomeMessage }));
@@ -123,6 +125,12 @@ wss.on('connection', (ws) => {
             if (conversationHistory.length === 0) {
                  console.log('[WS] Ignoring message: Configuration not yet received.');
                  return;
+            }
+            
+            // Log the conversation on the first real message from the user
+            if (!hasLoggedStart) {
+                hasLoggedStart = true;
+                await logConversationStart(siteUrlForLogging, secretKeyForLogging, connectionMode);
             }
 
             let transcript = '';
@@ -168,11 +176,9 @@ wss.on('connection', (ws) => {
                 conversationHistory.push({ role: 'user', content: transcript });
                 const reply = await getAIReply(conversationHistory);
                 conversationHistory.push({ role: 'assistant', content: reply });
-
                 if (ws.readyState === 1) {
                     ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: reply }));
                 }
-
                 if (connectionMode === 'voice') {
                     await speakText(reply, ws, currentLanguage);
                 }
@@ -196,14 +202,11 @@ server.on('upgrade', (req, socket, head) => {
     const origin = req.headers.origin;
     const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',');
 
-    // Check if the connection's origin is in our allowed list.
     if (allowedOrigins.includes(origin)) {
-        // If the origin is allowed, upgrade the connection.
         wss.handleUpgrade(req, socket, head, (ws) => {
             wss.emit('connection', ws, req);
         });
     } else {
-        // If the origin is not allowed, reject the connection.
         console.log(`[AUTH] Connection from origin "${origin}" rejected. ❌`);
         socket.destroy();
     }

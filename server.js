@@ -15,7 +15,6 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const ttsClient = new textToSpeech.TextToSpeechClient();
 const wss = new WebSocketServer({ noServer: true });
 
-// Optimal: Storing language config makes it easy to add more languages later.
 const languageConfig = {
     'en': { ttsCode: 'en-US', name: 'English' },
     'es': { ttsCode: 'es-ES', name: 'Spanish' },
@@ -23,8 +22,6 @@ const languageConfig = {
     'de': { ttsCode: 'de-DE', name: 'German' },
     'ja': { ttsCode: 'ja-JP', name: 'Japanese' },
 };
-
-// REMOVED: The hardcoded `baseSystemPrompt` is gone. It's now received from WordPress.
 
 async function transcribeWhisper(audioBuffer, langCode = 'en') {
   const tempFilePath = path.join(tmpdir(), `audio_${Date.now()}.webm`);
@@ -39,7 +36,7 @@ async function transcribeWhisper(audioBuffer, langCode = 'en') {
     return response.text;
   } catch (error) {
     console.error('[Whisper] Transcription error:', error);
-    return ''; // Return empty string on error
+    return '';
   } finally {
     fs.promises.unlink(tempFilePath).catch(err => console.error("Error deleting temp file:", err));
   }
@@ -70,60 +67,55 @@ async function speakText(text, ws, langCode = 'en') {
 }
 
 wss.on('connection', (ws) => {
-    console.log('[WS] New connection established. Waiting for initialization.');
+    console.log('[WS] New connection established. Requesting initialization.');
     
-    // Optimal: State is now scoped per-connection.
     let audioBufferArray = [];
     let connectionMode = 'text';
     let currentLanguage = 'en';
-    let conversationHistory = []; // Starts empty, initialized by the client.
+    let conversationHistory = [];
+    let isInitialized = false;
+
+    if (ws.readyState === 1) {
+        ws.send(JSON.stringify({ type: 'REQUEST_INIT' }));
+    }
 
     ws.on('message', async (message) => {
         let isCommand = false;
         try {
-            // Handle binary audio data first
             if (Buffer.isBuffer(message)) {
                 audioBufferArray.push(message);
                 return;
             }
 
-            // Handle text-based JSON commands
             const data = JSON.parse(message.toString());
             isCommand = true;
             let transcript = '';
 
-            // =================================================================
-            // NEW: Main initialization logic
-            // =================================================================
-            // Find and replace this entire block in server.js
-            if (data.type === 'INIT_SESSION') {
+            if (data.type === 'INIT_SESSION' && !isInitialized) {
+                isInitialized = true;
                 console.log('[WS] Initializing session...');
-            
-                // Set language for the session
+
                 const langCode = data.language || 'en';
                 if (languageConfig[langCode]) {
                     currentLanguage = langCode;
-                    const langName = languageConfig[langCode].name;
-                    console.log(`[WS] Language set to: ${langName}`);
+                    console.log(`[WS] Language set to: ${languageConfig[langCode].name}`);
                 }
                 
-                // Set the dynamic persona from WordPress
                 const persona = data.persona || 'You are a helpful assistant.';
                 conversationHistory = [
                     { role: 'system', content: `${persona} You must respond only in ${languageConfig[currentLanguage].name}.` }
                 ];
                 
-                // --- OPTIMIZATION ---
-                // Send an instant welcome message instead of waiting for the AI to generate one.
                 const welcomeMessage = "Hello! How can I help you today?";
                 if (ws.readyState === 1) {
                     ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: welcomeMessage }));
                 }
-                // Add the instant message to the history so the AI knows what was already said.
                 conversationHistory.push({ role: 'assistant', content: welcomeMessage });
                 
-                return; // End processing. The AI is now ready for the user's first message.
+                return;
             }
+
+            if (!isInitialized) return; // Ignore messages until initialized
 
             if (data.type === 'INIT_VOICE') {
                 console.log('[WS] Switching to voice mode.');
@@ -178,21 +170,15 @@ wss.on('connection', (ws) => {
 const port = process.env.PORT || 3000;
 const server = app.listen(port, () => console.log(`[HTTP] Server listening on port ${port}`));
 
-// Optimal: Securely handle WebSocket upgrades
-
 server.on('upgrade', (req, socket, head) => {
     const origin = req.headers.origin;
-    
-    // Get allowed origins from environment variable, default to an empty array
     const allowedOrigins = process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : [];
 
     if (allowedOrigins.includes(origin)) {
-        // Origin is allowed, proceed with the WebSocket upgrade
         wss.handleUpgrade(req, socket, head, (ws) => {
             wss.emit('connection', ws, req);
         });
     } else {
-        // Origin is not allowed, destroy the socket to reject the connection
         console.log(`[WS] Connection from origin ${origin} rejected.`);
         socket.destroy();
     }

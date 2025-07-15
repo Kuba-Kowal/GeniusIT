@@ -23,13 +23,19 @@ const languageConfig = {
     'ja': { ttsCode: 'ja-JP', name: 'Japanese' },
 };
 
+// **MODIFIED**: This function is now more defensive against missing data.
 function generateSystemPrompt(config) {
-    const agentName = config.agent_name || 'Rohan';
-    const companyName = config.company_name || 'the company';
-    const productInfo = config.product_service_info || 'our products and services';
-    let issuesAndSolutions = (config.faqs && config.faqs.length > 0)
-        ? config.faqs.filter(faq => faq.issue && faq.solution).map(faq => `Issue: ${faq.issue}\nSolution: ${faq.solution}`).join('\n\n')
+    // If config is null or undefined, default to an empty object to prevent crashes.
+    const safeConfig = (config && typeof config === 'object') ? config : {};
+
+    const agentName = safeConfig.agent_name || 'Rohan';
+    const companyName = safeConfig.company_name || 'the company';
+    const productInfo = safeConfig.product_service_info || 'our products and services';
+    
+    let issuesAndSolutions = (safeConfig.faqs && Array.isArray(safeConfig.faqs) && safeConfig.faqs.length > 0)
+        ? safeConfig.faqs.filter(faq => faq && faq.issue && faq.solution).map(faq => `Issue: ${faq.issue}\nSolution: ${faq.solution}`).join('\n\n')
         : 'No common issues provided.';
+
     return `You are a customer support live chat agent for ${companyName}. Your name is ${agentName}. You are friendly, professional, and empathetic. Your primary goal is to resolve customer issues efficiently and leave them with a positive impression of the company. Speak like a human support agent, not an AI. This means: Use short, clear sentences. Employ a conversational and friendly tone. Use contractions like "I'm," "you're," and "that's." Incorporate emojis where appropriate to convey tone, but do not overuse them. Be concise. Get straight to the point without unnecessary fluff or lengthy explanations. Your Core Responsibilities: Acknowledge and Empathize. Gather Information. Provide Solutions based on the company-specific information provided below. If you don't know the answer, politely ask the customer to hold while you check. Closing the Conversation: Once the issue is resolved, ask if there is anything else you can help with and wish them a good day. Company-Specific Information: Product/Service: ${productInfo}. Common Issues & Solutions:\n${issuesAndSolutions}. Escalation Protocol: If you cannot resolve the issue, state that you will create a ticket for the technical team.`;
 }
 
@@ -108,13 +114,19 @@ wss.on('connection', (ws) => {
             isCommand = true;
             
             if (data.type === 'CONFIG') {
-                siteUrlForLogging = data.data.site_url;
-                secretKeyForLogging = data.data.api_secret;
-                const configData = data.data.config;
+                // **MODIFIED**: Add defensive checks for the data payload.
+                const payload = data.data || {};
+                const configData = payload.config || {}; // Default to empty object if missing
+
+                siteUrlForLogging = payload.site_url;
+                secretKeyForLogging = payload.api_secret;
+
                 const basePrompt = generateSystemPrompt(configData);
-                const agentName = (configData && configData.agent_name) ? configData.agent_name : 'Alex';
+                const agentName = configData.agent_name || 'Alex'; // Now safe to access
+
                 conversationHistory = [{ role: 'system', content: `${basePrompt} You must respond only in English.` }];
                 const welcomeMessage = `Hi there! My name is ${agentName}. How can I help you today? 👋`;
+                
                 if (ws.readyState === 1) {
                     ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: welcomeMessage }));
                 }

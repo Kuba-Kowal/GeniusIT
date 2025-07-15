@@ -15,7 +15,6 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const ttsClient = new textToSpeech.TextToSpeechClient();
 const wss = new WebSocketServer({ noServer: true });
 
-// Optimal: Storing language config makes it easy to add more languages later.
 const languageConfig = {
     'en': { ttsCode: 'en-US', name: 'English' },
     'es': { ttsCode: 'es-ES', name: 'Spanish' },
@@ -24,7 +23,80 @@ const languageConfig = {
     'ja': { ttsCode: 'ja-JP', name: 'Japanese' },
 };
 
-// REMOVED: The hardcoded `baseSystemPrompt` is gone. It's now received from WordPress.
+// **MODIFIED**: Added new instructions for extreme brevity.
+const baseSystemPrompt = `"You are a customer support live chat agent for Genius Tech. Your name is Rohan. You are friendly, professional, and empathetic. Your primary goal is to resolve customer issues efficiently and leave them with a positive impression of the company.
+
+Speak like a human support agent, not an AI. This means:
+
+Use short, clear sentences.
+
+Employ a conversational and friendly tone. Use contractions like "I'm," "you're," and "that's."
+
+Incorporate emojis where appropriate to convey tone, but do not overuse them.
+
+Be concise. Get straight to the point without unnecessary fluff or lengthy explanations. Avoid "blabbing."
+
+Never sound robotic or overly formal.
+
+Your Core Responsibilities:
+
+Acknowledge and Empathize: Start by acknowledging the customer's issue and showing you understand their frustration.
+
+Gather Information: Ask clarifying questions to understand the problem fully.
+
+Provide Solutions: Offer clear, step-by-step solutions. If you don't know the answer, politely place the customer on a brief hold to "check with a colleague" or "look up the information."
+
+Maintain a Positive Tone: Even with frustrated customers, remain calm, positive, and reassuring.
+
+Be Proactive: If a customer is on a specific page of the website, you can offer proactive help related to that page.
+
+Standard Operating Procedures:
+
+Greeting: Start the chat with a warm and personal greeting. Use the customer's name if it's available. For example: "Hi [Customer Name], thanks for reaching out! I'm [Agent Name], how can I help you today?"
+
+Placing on Hold: If you need time to investigate, always ask for permission. For example: "Would you mind holding for a moment while I look into that for you?" When you return, thank them for their patience: "Thanks for waiting. I've found the information for you."
+
+Apologizing: If the company has made an error, offer a sincere apology. For example: "I'm so sorry to hear you've had this experience. Let's get this sorted for you right away."
+
+Handling Angry Customers: Remain calm and empathetic. Acknowledge their frustration and focus on the solution. For example: "I understand how frustrating this must be. I'm going to do everything I can to resolve this for you."
+
+Closing the Conversation: Once the issue is resolved, end the chat on a positive note. Ask if there is anything else you can help with. For example: "I'm glad I could help with that! Is there anything else you need assistance with today?" If not, wish them a good day.
+
+Company-Specific Information:
+
+Product/Service: Accounting Product Quickbooks
+
+Common Issues & Solutions:
+
+Issue: Crashing
+
+Solution: Hit the computer
+
+Issue: [Common Customer Problem 2]
+
+Solution: [Step-by-step solution 2]
+
+Issue: [Common Customer Problem 3]
+
+Solution: [Step-by-step solution 3]
+
+Escalation Protocol: If you cannot resolve the issue, the escalation path is to [Describe the escalation process, e.g., "create a ticket for our technical team"]. Never promise a callback or a direct transfer unless that is a standard procedure.
+
+Example Interactions:
+
+Good Example:
+
+Customer: "My order hasn't arrived."
+
+You: "I'm sorry to hear that. I can definitely look into it for you. Could you please provide your order number?"
+
+Bad Example (What to Avoid):
+
+Customer: "My order hasn't arrived."
+
+You: "I have received your query regarding the non-arrival of your order. In order to assist you further, I will require your order identification number. Please provide this information so that I may access our order management system and investigate the status of your shipment."
+
+By adhering to this comprehensive prompt, ChatGPT-4o-Mini can effectively function as a top-tier customer support agent, providing human-like, efficient, and satisfactory resolutions to customer inquiries.`
 
 async function transcribeWhisper(audioBuffer, langCode = 'en') {
   const tempFilePath = path.join(tmpdir(), `audio_${Date.now()}.webm`);
@@ -39,20 +111,15 @@ async function transcribeWhisper(audioBuffer, langCode = 'en') {
     return response.text;
   } catch (error) {
     console.error('[Whisper] Transcription error:', error);
-    return ''; // Return empty string on error
+    throw error;
   } finally {
-    fs.promises.unlink(tempFilePath).catch(err => console.error("Error deleting temp file:", err));
+    await fs.promises.unlink(tempFilePath).catch(err => console.error("Error deleting temp file:", err));
   }
 }
 
 async function getAIReply(history) {
-    try {
-        const chatCompletion = await openai.chat.completions.create({ model: 'gpt-4o-mini', messages: history });
-        return chatCompletion.choices[0].message.content;
-    } catch (error) {
-        console.error('[OpenAI] Chat completion error:', error);
-        return 'I seem to be having trouble connecting. Please try again in a moment.';
-    }
+    const chatCompletion = await openai.chat.completions.create({ model: 'gpt-4o-mini', messages: history });
+    return chatCompletion.choices[0].message.content;
 }
 
 async function speakText(text, ws, langCode = 'en') {
@@ -70,57 +137,36 @@ async function speakText(text, ws, langCode = 'en') {
 }
 
 wss.on('connection', (ws) => {
-    console.log('[WS] New connection established. Waiting for initialization.');
-    
-    // Optimal: State is now scoped per-connection.
+    console.log('[WS] New persistent connection established.');
     let audioBufferArray = [];
     let connectionMode = 'text';
     let currentLanguage = 'en';
-    let conversationHistory = []; // Starts empty, initialized by the client.
+
+    let conversationHistory = [{ role: 'system', content: `${baseSystemPrompt} You must respond only in English.` }];
+
+    const welcomeMessage = "Hello! I'm Alex. How can I help?"; // Made welcome slightly shorter too
+    if (ws.readyState === 1) {
+        ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: welcomeMessage }));
+    }
 
     ws.on('message', async (message) => {
         let isCommand = false;
-        try {
-            // Handle binary audio data first
-            if (Buffer.isBuffer(message)) {
-                audioBufferArray.push(message);
-                return;
-            }
 
-            // Handle text-based JSON commands
+        try {
             const data = JSON.parse(message.toString());
             isCommand = true;
+
             let transcript = '';
 
-            // =================================================================
-            // NEW: Main initialization logic
-            // =================================================================
-            if (data.type === 'INIT_SESSION') {
-                console.log('[WS] Initializing session...');
-
-                // Set language for the session
-                const langCode = data.language || 'en';
+            if (data.type === 'SET_LANGUAGE') {
+                const langCode = data.language;
                 if (languageConfig[langCode]) {
                     currentLanguage = langCode;
-                    console.log(`[WS] Language set to: ${languageConfig[langCode].name}`);
+                    const langName = languageConfig[langCode].name;
+                    conversationHistory[0].content = `${baseSystemPrompt} You must respond only in ${langName}.`;
+                    console.log(`[WS] Language set to: ${langName}`);
                 }
-                
-                // Set the dynamic persona from WordPress
-                const persona = data.persona || 'You are a helpful assistant.';
-                conversationHistory = [
-                    { role: 'system', content: `${persona} You must respond only in ${languageConfig[currentLanguage].name}.` },
-                    // Add a dummy user message to prompt the AI's greeting
-                    { role: 'user', content: 'GREETING' } 
-                ];
-                
-                // Get and send the AI's introductory message
-                const initialReply = await getAIReply(conversationHistory);
-                conversationHistory.push({ role: 'assistant', content: initialReply });
-                
-                if (ws.readyState === 1) {
-                    ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: initialReply }));
-                }
-                return; // End processing after initialization
+                return;
             }
 
             if (data.type === 'INIT_VOICE') {
@@ -161,8 +207,8 @@ wss.on('connection', (ws) => {
                 }
             }
         } catch (error) {
-            if (!isCommand) {
-                console.error('[Process] Received non-buffer, non-JSON message:', message.toString());
+            if (!isCommand && Buffer.isBuffer(message)) {
+                audioBufferArray.push(message);
             } else {
                 console.error('[Process] Error processing command:', error);
             }
@@ -173,13 +219,5 @@ wss.on('connection', (ws) => {
     ws.on('error', (err) => console.error('[WS] Connection error:', err));
 });
 
-const port = process.env.PORT || 3000;
-const server = app.listen(port, () => console.log(`[HTTP] Server listening on port ${port}`));
-
-// Optimal: Securely handle WebSocket upgrades
-server.on('upgrade', (req, socket, head) => {
-    // Here you could add origin verification for security
-    wss.handleUpgrade(req, socket, head, (ws) => {
-        wss.emit('connection', ws, req);
-    });
-});
+const server = app.listen(process.env.PORT || 3000, () => console.log(`[HTTP] Server listening on port ${process.env.PORT || 3000}`));
+server.on('upgrade', (req, socket, head) => wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req)));

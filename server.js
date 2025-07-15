@@ -191,4 +191,20 @@ wss.on('connection', (ws) => {
 });
 
 const server = app.listen(process.env.PORT || 3000, () => console.log(`[HTTP] Server listening on port ${process.env.PORT || 3000}`));
-server.on('upgrade', (req, socket, head) => wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req)));
+
+server.on('upgrade', (req, socket, head) => {
+    const origin = req.headers.origin;
+    const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',');
+
+    // Check if the connection's origin is in our allowed list.
+    if (allowedOrigins.includes(origin)) {
+        // If the origin is allowed, upgrade the connection.
+        wss.handleUpgrade(req, socket, head, (ws) => {
+            wss.emit('connection', ws, req);
+        });
+    } else {
+        // If the origin is not allowed, reject the connection.
+        console.log(`[AUTH] Connection from origin "${origin}" rejected. ❌`);
+        socket.destroy();
+    }
+});

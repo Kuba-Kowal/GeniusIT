@@ -39,14 +39,19 @@ async function logConversationStart(siteUrl, secretKey, interactionType) {
         console.log('[Analytics] Missing data. Skipping log.');
         return;
     }
-    const endpoint = `${siteUrl}/wp-json/bvr-analytics/v1/log`;
+
+    const endpoint = `${siteUrl}/wp-json/bvr-analytics/v1/log?interaction_type=${interactionType}`;
+    
     try {
         const response = await fetch(endpoint, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${secretKey}` },
-            body: JSON.stringify({ interaction_type: interactionType })
+            method: 'GET', // Using GET for this test
+            headers: {
+                'Authorization': `Bearer ${secretKey}`
+            }
         });
-        if (!response.ok) { throw new Error(`Analytics API returned ${response.status}`); }
+        if (!response.ok) {
+            throw new Error(`Analytics API returned ${response.status}`);
+        }
         console.log(`[Analytics] Logged '${interactionType}' conversation to ${siteUrl}`);
     } catch (error) {
         console.error('[Analytics] Failed to log conversation:', error.message);
@@ -98,7 +103,6 @@ wss.on('connection', (ws) => {
     let hasLoggedStart = false;
 
     ws.on('message', async (message) => {
-        // Log the raw message string as soon as it arrives
         console.log('[BVR DEBUG] Raw message received from client:', message.toString());
 
         let isCommand = false;

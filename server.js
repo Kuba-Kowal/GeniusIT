@@ -9,39 +9,12 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 const app = express();
-app.use(express.json());
+app.use(express.json()); // Middleware to parse JSON bodies
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const ttsClient = new textToSpeech.TextToSpeechClient();
 const wss = new WebSocketServer({ noServer: true });
-
-// --- START: JOB QUEUE IMPLEMENTATION ---
-const jobQueue = [];
-let isWorkerRunning = false;
-
-async function processJobQueue() {
-    if (isWorkerRunning) return;
-    isWorkerRunning = true;
-
-    while (jobQueue.length > 0) {
-        const job = jobQueue.shift(); // Get the next job
-        try {
-            const reply = await getAIReply(job.conversationHistory);
-            job.conversationHistory.push({ role: 'assistant', content: reply });
-
-            if (job.ws.readyState === 1) {
-                job.ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: reply }));
-                if (job.connectionMode === 'voice') {
-                    await speakText(reply, job.ws, job.currentLanguage);
-                }
-            }
-        } catch (error) {
-            console.error('[Worker] Error processing job:', error);
-        }
-    }
-    isWorkerRunning = false;
-}
-// --- END: JOB QUEUE IMPLEMENTATION ---
+const port = process.env.PORT || 3000;
 
 const languageConfig = {
     'en': { ttsCode: 'en-US', name: 'English' },
@@ -66,19 +39,6 @@ async function transcribeWhisper(audioBuffer, langCode = 'en') {
   }
 }
 
-async function getAIReply(history) {
-    console.log('[OpenAI] Attempting to get AI reply...');
-    try {
-        const chatCompletion = await openai.chat.completions.create({ model: 'gpt-4o-mini', messages: history });
-        const reply = chatCompletion.choices[0].message.content;
-        console.log('[OpenAI] Successfully received reply.');
-        return reply;
-    } catch (error) {
-        console.error('[OpenAI] API call failed:', error);
-        return 'I apologize, but I encountered an error. Please try again.';
-    }
-}
-
 async function speakText(text, ws, langCode = 'en') {
   try {
     const config = languageConfig[langCode] || languageConfig['en'];
@@ -93,27 +53,35 @@ async function speakText(text, ws, langCode = 'en') {
   }
 }
 
-// Test endpoint (can be removed in production)
-app.get('/test-openai', async (req, res) => {
-    console.log('[Test] Attempting OpenAI test...');
+// =============================================================================
+// NEW: Internal HTTP Endpoint to handle the OpenAI API call
+// =============================================================================
+app.post('/get-reply', async (req, res) => {
+    const { history } = req.body;
+
+    if (!history) {
+        return res.status(400).json({ error: 'Conversation history is required.' });
+    }
+
+    console.log('[HTTP Endpoint] Received request to get AI reply...');
     try {
-        const response = await openai.chat.completions.create({ model: 'gpt-4o-mini', messages: [{ role: 'user', content: 'Hello' }] });
-        console.log('[Test] OpenAI API test successful!');
-        res.send('OpenAI API test successful!');
+        const chatCompletion = await openai.chat.completions.create({ 
+            model: 'gpt-4o-mini', 
+            messages: history 
+        });
+        const reply = chatCompletion.choices[0].message.content;
+        console.log('[HTTP Endpoint] Successfully got reply from OpenAI.');
+        res.json({ reply: reply });
     } catch (error) {
-        console.error('[Test] OpenAI API test failed:', error);
-        res.status(500).send('OpenAI API test failed. Check server logs.');
+        console.error('[HTTP Endpoint] OpenAI API call failed:', error);
+        res.status(500).json({ error: 'Failed to get reply from AI.' });
     }
 });
 
 wss.on('connection', (ws) => {
     console.log('[WS] New connection established. Requesting initialization.');
     
-    let audioBufferArray = [];
-    let connectionMode = 'text';
-    let currentLanguage = 'en';
-    let conversationHistory = [];
-    let isInitialized = false;
+    let audioBufferArray = [], connectionMode = 'text', currentLanguage = 'en', conversationHistory = [], isInitialized = false;
 
     if (ws.readyState === 1) {
         ws.send(JSON.stringify({ type: 'REQUEST_INIT' }));
@@ -135,12 +103,8 @@ wss.on('connection', (ws) => {
                     isInitialized = true;
                     console.log('[WS] Initializing session...');
                     const langCode = data.language || 'en';
-                    if (languageConfig[langCode]) {
-                        currentLanguage = langCode;
-                        console.log(`[WS] Language set to: ${languageConfig[langCode].name}`);
-                    }
-                    const persona = data.persona || 'You are a helpful assistant.';
-                    conversationHistory = [{ role: 'system', content: `${persona} You must respond only in ${languageConfig[currentLanguage].name}.` }];
+                    if (languageConfig[langCode]) currentLanguage = langCode;
+                    conversationHistory = [{ role: 'system', content: data.persona || 'You are a helpful assistant.' }];
                     const welcomeMessage = "Hello! How can I help you today?";
                     if (ws.readyState === 1) {
                         ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: welcomeMessage }));
@@ -156,23 +120,39 @@ wss.on('connection', (ws) => {
                     const completeAudioBuffer = Buffer.concat(audioBufferArray);
                     audioBufferArray = [];
                     transcript = await transcribeWhisper(completeAudioBuffer, currentLanguage);
-                    if (transcript && transcript.trim() && ws.readyState === 1) {
+                    if (transcript.trim() && ws.readyState === 1) {
                         ws.send(JSON.stringify({ type: 'USER_TRANSCRIPT', text: transcript }));
                     }
                     break;
-                case 'INIT_VOICE':
-                    if (isInitialized) connectionMode = 'voice';
-                    break;
-                case 'END_VOICE':
-                    if (isInitialized) connectionMode = 'text';
-                    break;
+                case 'INIT_VOICE': if (isInitialized) connectionMode = 'voice'; break;
+                case 'END_VOICE': if (isInitialized) connectionMode = 'text'; break;
             }
 
             if (transcript && transcript.trim()) {
                 conversationHistory.push({ role: 'user', content: transcript });
-                // MODIFIED: Add a job to the queue instead of awaiting here
-                jobQueue.push({ ws, conversationHistory, connectionMode, currentLanguage });
-                processJobQueue(); // Start the worker
+
+                // MODIFIED: Call our own reliable HTTP endpoint instead of calling OpenAI directly
+                console.log('[WS] Forwarding request to internal /get-reply endpoint...');
+                const response = await fetch(`http://localhost:${port}/get-reply`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ history: conversationHistory }),
+                });
+
+                if (!response.ok) {
+                    throw new Error(`Internal API call failed with status: ${response.status}`);
+                }
+
+                const { reply } = await response.json();
+                conversationHistory.push({ role: 'assistant', content: reply });
+
+                if (ws.readyState === 1) {
+                    ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: reply }));
+                }
+
+                if (connectionMode === 'voice') {
+                    await speakText(reply, ws, currentLanguage);
+                }
             }
         } catch (error) {
             console.error('[Process] Error processing message:', error);
@@ -183,7 +163,6 @@ wss.on('connection', (ws) => {
     ws.on('error', (err) => console.error('[WS] Connection error:', err));
 });
 
-const port = process.env.PORT || 3000;
 const server = app.listen(port, () => console.log(`[HTTP] Server listening on port ${port}`));
 
 server.on('upgrade', (req, socket, head) => {

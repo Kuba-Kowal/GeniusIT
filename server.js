@@ -6,10 +6,10 @@ import { tmpdir } from 'os';
 import { OpenAI } from 'openai';
 import textToSpeech from '@google-cloud/text-to-speech';
 import dotenv from 'dotenv';
-import admin from 'firebase-admin'; // Import Firebase Admin SDK
+import admin from 'firebase-admin';
 dotenv.config();
 
-// ** NEW: Initialize Firebase Admin **
+// Initialize Firebase Admin
 try {
     const serviceAccount = JSON.parse(process.env.FIREBASE_CREDENTIALS);
     admin.initializeApp({
@@ -19,7 +19,7 @@ try {
 } catch (error) {
     console.error('[Firebase] Failed to initialize Admin SDK. Check your FIREBASE_CREDENTIALS environment variable.', error.message);
 }
-const db = admin.firestore(); // Get Firestore instance
+const db = admin.firestore();
 
 const app = express();
 app.use(express.json());
@@ -47,19 +47,67 @@ function generateSystemPrompt(config) {
     return `You are a customer support live chat agent for ${companyName}. Your name is ${agentName}. You are friendly, professional, and empathetic. Your primary goal is to resolve customer issues efficiently and leave them with a positive impression of the company. Speak like a human support agent, not an AI. This means: Use short, clear sentences. Employ a conversational and friendly tone. Use contractions like "I'm," "you're," and "that's." Incorporate emojis where appropriate to convey tone, but do not overuse them. Be concise. Get straight to the point without unnecessary fluff or lengthy explanations. Your Core Responsibilities: Acknowledge and Empathize. Gather Information. Provide Solutions based on the company-specific information provided below. If you don't know the answer, politely ask the customer to hold while you check. Closing the Conversation: Once the issue is resolved, ask if there is anything else you can help with and wish them a good day. Company-Specific Information: Product/Service: ${productInfo}. Common Issues & Solutions:\n${issuesAndSolutions}. Escalation Protocol: If you cannot resolve the issue, state that you will create a ticket for the technical team.`;
 }
 
-// ** MODIFIED: This function now writes to Firestore **
-async function logConversationStart(interactionType, origin) {
+async function analyzeConversation(history) {
+    const transcript = history
+        .filter(msg => msg.role === 'user' || msg.role === 'assistant')
+        .map(msg => `${msg.role}: ${msg.content}`)
+        .join('\n');
+
+    if (!transcript) {
+        return { sentiment: 'N/A', subject: 'Empty Conversation' };
+    }
+
+    try {
+        const analysisPrompt = `Analyze the following chat transcript. Determine the user's overall sentiment (one word: Positive, Negative, or Neutral) and create a concise subject line for the conversation (5 words or less).
+        
+        Transcript:
+        ${transcript}
+
+        Return your answer as a single, valid JSON object with two keys: "sentiment" and "subject". For example: {"sentiment": "Positive", "subject": "Question about pricing plans"}`;
+
+        const response = await openai.chat.completions.create({
+            model: 'gpt-4o-mini',
+            messages: [{ role: 'system', content: analysisPrompt }],
+            response_format: { type: "json_object" }
+        });
+
+        const analysis = JSON.parse(response.choices[0].message.content);
+        return {
+            sentiment: analysis.sentiment || 'Unknown',
+            subject: analysis.subject || 'No Subject'
+        };
+    } catch (error) {
+        console.error('[AI Analysis] Failed to analyze conversation:', error);
+        return { sentiment: 'Error', subject: 'Analysis Failed' };
+    }
+}
+
+async function logConversation(history, interactionType, origin, startTime) {
     if (!db) {
         console.log('[Firestore] Database not initialized. Skipping log.');
         return;
     }
+    if (history.length <= 2) {
+        console.log('[Firestore] Conversation too short. Skipping log.');
+        return;
+    }
+
     try {
+        const { sentiment, subject } = await analyzeConversation(history);
+        const fullTranscript = history
+            .map(msg => `[${msg.role}] ${msg.content}`)
+            .join('\n---\n');
+        
         await db.collection('conversations').add({
             interaction_type: interactionType,
-            start_time: admin.firestore.FieldValue.serverTimestamp(),
-            origin: origin || 'unknown' // Log the website origin for tracking
+            origin: origin || 'unknown',
+            start_time: startTime,
+            end_time: admin.firestore.FieldValue.serverTimestamp(),
+            sentiment: sentiment,
+            subject: subject,
+            transcript: fullTranscript
         });
-        console.log(`[Firestore] Logged '${interactionType}' conversation from ${origin}`);
+        console.log(`[Firestore] Logged conversation: "${subject}"`);
     } catch (error) {
         console.error('[Firestore] Failed to log conversation:', error.message);
     }
@@ -99,14 +147,14 @@ async function speakText(text, ws, langCode = 'en') {
     }
 }
 
-wss.on('connection', (ws, req) => { // Added req to get origin
+wss.on('connection', (ws, req) => {
     console.log('[WS] New persistent connection established.');
     let audioBufferArray = [];
     let connectionMode = 'text';
     let currentLanguage = 'en';
     let conversationHistory = [];
-    let hasLoggedStart = false;
-    const origin = req.headers.origin; // Get origin for logging
+    const origin = req.headers.origin;
+    const startTime = new Date();
 
     ws.on('message', async (message) => {
         let isCommand = false;
@@ -131,11 +179,6 @@ wss.on('connection', (ws, req) => { // Added req to get origin
                 console.log('[WS] Ignoring message: Configuration not yet received.');
                 return;
             }
-            
-            if (!hasLoggedStart) {
-                hasLoggedStart = true;
-                await logConversationStart(connectionMode, origin);
-            }
 
             let transcript = '';
 
@@ -153,13 +196,10 @@ wss.on('connection', (ws, req) => { // Added req to get origin
             }
 
             if (data.type === 'INIT_VOICE') {
-                console.log('[WS] Switching to voice mode.');
                 connectionMode = 'voice';
                 return;
             }
-
             if (data.type === 'END_VOICE') {
-                console.log('[WS] Switching back to text mode.');
                 connectionMode = 'text';
                 return;
             }
@@ -196,7 +236,11 @@ wss.on('connection', (ws, req) => { // Added req to get origin
         }
     });
 
-    ws.on('close', () => console.log('[WS] Connection closed.'));
+    ws.on('close', async () => {
+        console.log('[WS] Connection closed.');
+        await logConversation(conversationHistory, connectionMode, origin, startTime);
+    });
+
     ws.on('error', (err) => console.error('[WS] Connection error:', err));
 });
 
@@ -205,7 +249,6 @@ const server = app.listen(process.env.PORT || 3000, () => console.log(`[HTTP] Se
 server.on('upgrade', (req, socket, head) => {
     const origin = req.headers.origin;
     const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',');
-
     if (allowedOrigins.includes(origin)) {
         wss.handleUpgrade(req, socket, head, (ws) => {
             wss.emit('connection', ws, req);

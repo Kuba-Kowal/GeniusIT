@@ -32,7 +32,8 @@ async function transcribeWhisper(audioBuffer, langCode = 'en') {
     const response = await openai.audio.transcriptions.create({ file: fileStream, model: 'whisper-1', language: langCode });
     return response.text;
   } catch (error) {
-    console.error('[Whisper] Transcription error:', error); return '';
+    console.error('[Whisper] Transcription error:', error);
+    return '';
   } finally {
     fs.promises.unlink(tempFilePath).catch(err => console.error("Error deleting temp file:", err));
   }
@@ -125,18 +126,9 @@ wss.on('connection', (ws) => {
 
 const server = app.listen(port, () => console.log(`[HTTP] Server listening on port ${port}`));
 
+// Simplified upgrade handler without origin verification
 server.on('upgrade', (req, socket, head) => {
-    const origin = req.headers.origin;
-    const allowedOriginsRaw = process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : [];
-    const allowedOrigins = allowedOriginsRaw.map(o => o.trim().replace(/\/$/, ''));
-    const normalizedOrigin = origin ? origin.trim().replace(/\/$/, '') : '';
-
-    if (allowedOrigins.includes(normalizedOrigin)) {
-        wss.handleUpgrade(req, socket, head, (ws) => {
-            wss.emit('connection', ws, req);
-        });
-    } else {
-        console.log(`[Upgrade] Connection from origin ${origin} rejected.`);
-        socket.destroy();
-    }
+    wss.handleUpgrade(req, socket, head, (ws) => {
+        wss.emit('connection', ws, req);
+    });
 });

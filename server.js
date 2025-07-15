@@ -23,80 +23,38 @@ const languageConfig = {
     'ja': { ttsCode: 'ja-JP', name: 'Japanese' },
 };
 
-// **MODIFIED**: Added new instructions for extreme brevity.
-const baseSystemPrompt = `"You are a customer support live chat agent for Genius Tech. Your name is Rohan. You are friendly, professional, and empathetic. Your primary goal is to resolve customer issues efficiently and leave them with a positive impression of the company.
+function generateSystemPrompt(config) {
+    const agentName = config.agent_name || 'Rohan';
+    const companyName = config.company_name || 'the company';
+    const productInfo = config.product_service_info || 'our products and services';
+
+    let issuesAndSolutions = (config.faqs && config.faqs.length > 0)
+        ? config.faqs.map(faq => `Issue: ${faq.issue}\nSolution: ${faq.solution}`).join('\n\n')
+        : 'No common issues provided.';
+
+    return `You are a customer support live chat agent for ${companyName}. Your name is ${agentName}. You are friendly, professional, and empathetic. Your primary goal is to resolve customer issues efficiently and leave them with a positive impression of the company.
 
 Speak like a human support agent, not an AI. This means:
-
-Use short, clear sentences.
-
-Employ a conversational and friendly tone. Use contractions like "I'm," "you're," and "that's."
-
-Incorporate emojis where appropriate to convey tone, but do not overuse them.
-
-Be concise. Get straight to the point without unnecessary fluff or lengthy explanations. Avoid "blabbing."
-
-Never sound robotic or overly formal.
+- Use short, clear sentences.
+- Employ a conversational and friendly tone. Use contractions like "I'm," "you're," and "that's."
+- Incorporate emojis where appropriate to convey tone, but do not overuse them.
+- Be concise. Get straight to the point without unnecessary fluff or lengthy explanations.
 
 Your Core Responsibilities:
+- Acknowledge and Empathize: Start by acknowledging the customer's issue.
+- Gather Information: Ask clarifying questions to understand the problem fully.
+- Provide Solutions: Offer clear, step-by-step solutions based on the company-specific information provided below. If you don't know the answer, politely ask the customer to hold while you check.
 
-Acknowledge and Empathize: Start by acknowledging the customer's issue and showing you understand their frustration.
-
-Gather Information: Ask clarifying questions to understand the problem fully.
-
-Provide Solutions: Offer clear, step-by-step solutions. If you don't know the answer, politely place the customer on a brief hold to "check with a colleague" or "look up the information."
-
-Maintain a Positive Tone: Even with frustrated customers, remain calm, positive, and reassuring.
-
-Be Proactive: If a customer is on a specific page of the website, you can offer proactive help related to that page.
-
-Standard Operating Procedures:
-
-Greeting: Start the chat with a warm and personal greeting. Use the customer's name if it's available. For example: "Hi [Customer Name], thanks for reaching out! I'm [Agent Name], how can I help you today?"
-
-Placing on Hold: If you need time to investigate, always ask for permission. For example: "Would you mind holding for a moment while I look into that for you?" When you return, thank them for their patience: "Thanks for waiting. I've found the information for you."
-
-Apologizing: If the company has made an error, offer a sincere apology. For example: "I'm so sorry to hear you've had this experience. Let's get this sorted for you right away."
-
-Handling Angry Customers: Remain calm and empathetic. Acknowledge their frustration and focus on the solution. For example: "I understand how frustrating this must be. I'm going to do everything I can to resolve this for you."
-
-Closing the Conversation: Once the issue is resolved, end the chat on a positive note. Ask if there is anything else you can help with. For example: "I'm glad I could help with that! Is there anything else you need assistance with today?" If not, wish them a good day.
+Closing the Conversation: Once the issue is resolved, ask if there is anything else you can help with and wish them a good day.
 
 Company-Specific Information:
-
-Product/Service: Accounting Product Quickbooks
+Product/Service: ${productInfo}
 
 Common Issues & Solutions:
+${issuesAndSolutions}
 
-Issue: Crashing
-
-Solution: Hit the computer
-
-Issue: [Common Customer Problem 2]
-
-Solution: [Step-by-step solution 2]
-
-Issue: [Common Customer Problem 3]
-
-Solution: [Step-by-step solution 3]
-
-Escalation Protocol: If you cannot resolve the issue, the escalation path is to [Describe the escalation process, e.g., "create a ticket for our technical team"]. Never promise a callback or a direct transfer unless that is a standard procedure.
-
-Example Interactions:
-
-Good Example:
-
-Customer: "My order hasn't arrived."
-
-You: "I'm sorry to hear that. I can definitely look into it for you. Could you please provide your order number?"
-
-Bad Example (What to Avoid):
-
-Customer: "My order hasn't arrived."
-
-You: "I have received your query regarding the non-arrival of your order. In order to assist you further, I will require your order identification number. Please provide this information so that I may access our order management system and investigate the status of your shipment."
-
-By adhering to this comprehensive prompt, ChatGPT-4o-Mini can effectively function as a top-tier customer support agent, providing human-like, efficient, and satisfactory resolutions to customer inquiries.`
+Escalation Protocol: If you cannot resolve the issue, state that you will create a ticket for the technical team.`;
+}
 
 async function transcribeWhisper(audioBuffer, langCode = 'en') {
   const tempFilePath = path.join(tmpdir(), `audio_${Date.now()}.webm`);
@@ -141,20 +99,31 @@ wss.on('connection', (ws) => {
     let audioBufferArray = [];
     let connectionMode = 'text';
     let currentLanguage = 'en';
-
-    let conversationHistory = [{ role: 'system', content: `${baseSystemPrompt} You must respond only in English.` }];
-
-    const welcomeMessage = "Hello! I'm Alex. How can I help?"; // Made welcome slightly shorter too
-    if (ws.readyState === 1) {
-        ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: welcomeMessage }));
-    }
+    let conversationHistory = []; // Start empty
 
     ws.on('message', async (message) => {
         let isCommand = false;
-
         try {
             const data = JSON.parse(message.toString());
             isCommand = true;
+            
+            if (data.type === 'CONFIG') {
+                const basePrompt = generateSystemPrompt(data.data);
+                const agentName = data.data.agent_name || 'Alex';
+                conversationHistory = [{ role: 'system', content: `${basePrompt} You must respond only in English.` }];
+                
+                const welcomeMessage = `Hi there! My name is ${agentName}. How can I help you today? 👋`;
+                if (ws.readyState === 1) {
+                    ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: welcomeMessage }));
+                }
+                console.log(`[WS] Config received. Agent: ${agentName}.`);
+                return;
+            }
+
+            if (conversationHistory.length === 0) {
+                 console.log('[WS] Ignoring message: Configuration not yet received.');
+                 return;
+            }
 
             let transcript = '';
 
@@ -163,7 +132,9 @@ wss.on('connection', (ws) => {
                 if (languageConfig[langCode]) {
                     currentLanguage = langCode;
                     const langName = languageConfig[langCode].name;
-                    conversationHistory[0].content = `${baseSystemPrompt} You must respond only in ${langName}.`;
+                    if (conversationHistory.length > 0) {
+                        conversationHistory[0].content = conversationHistory[0].content.replace(/You must respond only in \w+\./, `You must respond only in ${langName}.`);
+                    }
                     console.log(`[WS] Language set to: ${langName}`);
                 }
                 return;

@@ -43,12 +43,19 @@ async function transcribeWhisper(audioBuffer, langCode = 'en') {
 }
 
 async function getAIReply(history) {
+    console.log('[OpenAI] Attempting to get AI reply...');
     try {
-        const chatCompletion = await openai.chat.completions.create({ model: 'gpt-4o-mini', messages: history });
-        return chatCompletion.choices[0].message.content;
+        const chatCompletion = await openai.chat.completions.create({ 
+            model: 'gpt-4o-mini', 
+            messages: history 
+        });
+        const reply = chatCompletion.choices[0].message.content;
+        console.log('[OpenAI] Successfully received reply.');
+        return reply;
     } catch (error) {
-        console.error('[OpenAI] Chat completion error:', error);
-        return 'I seem to be having trouble connecting. Please try again in a moment.';
+        // This will log the specific error if the API call fails
+        console.error('[OpenAI] API call failed:', error);
+        return 'I apologize, but I encountered an error trying to connect to my brain. Please try again.';
     }
 }
 

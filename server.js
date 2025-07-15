@@ -23,19 +23,14 @@ const languageConfig = {
     'ja': { ttsCode: 'ja-JP', name: 'Japanese' },
 };
 
-// **MODIFIED**: This function is now more defensive against missing data.
 function generateSystemPrompt(config) {
-    // If config is null or undefined, default to an empty object to prevent crashes.
     const safeConfig = (config && typeof config === 'object') ? config : {};
-
     const agentName = safeConfig.agent_name || 'Rohan';
     const companyName = safeConfig.company_name || 'the company';
     const productInfo = safeConfig.product_service_info || 'our products and services';
-    
     let issuesAndSolutions = (safeConfig.faqs && Array.isArray(safeConfig.faqs) && safeConfig.faqs.length > 0)
         ? safeConfig.faqs.filter(faq => faq && faq.issue && faq.solution).map(faq => `Issue: ${faq.issue}\nSolution: ${faq.solution}`).join('\n\n')
         : 'No common issues provided.';
-
     return `You are a customer support live chat agent for ${companyName}. Your name is ${agentName}. You are friendly, professional, and empathetic. Your primary goal is to resolve customer issues efficiently and leave them with a positive impression of the company. Speak like a human support agent, not an AI. This means: Use short, clear sentences. Employ a conversational and friendly tone. Use contractions like "I'm," "you're," and "that's." Incorporate emojis where appropriate to convey tone, but do not overuse them. Be concise. Get straight to the point without unnecessary fluff or lengthy explanations. Your Core Responsibilities: Acknowledge and Empathize. Gather Information. Provide Solutions based on the company-specific information provided below. If you don't know the answer, politely ask the customer to hold while you check. Closing the Conversation: Once the issue is resolved, ask if there is anything else you can help with and wish them a good day. Company-Specific Information: Product/Service: ${productInfo}. Common Issues & Solutions:\n${issuesAndSolutions}. Escalation Protocol: If you cannot resolve the issue, state that you will create a ticket for the technical team.`;
 }
 
@@ -48,15 +43,10 @@ async function logConversationStart(siteUrl, secretKey, interactionType) {
     try {
         const response = await fetch(endpoint, {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${secretKey}`
-            },
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${secretKey}` },
             body: JSON.stringify({ interaction_type: interactionType })
         });
-        if (!response.ok) {
-            throw new Error(`Analytics API returned ${response.status}`);
-        }
+        if (!response.ok) { throw new Error(`Analytics API returned ${response.status}`); }
         console.log(`[Analytics] Logged '${interactionType}' conversation to ${siteUrl}`);
     } catch (error) {
         console.error('[Analytics] Failed to log conversation:', error.message);
@@ -108,25 +98,23 @@ wss.on('connection', (ws) => {
     let hasLoggedStart = false;
 
     ws.on('message', async (message) => {
+        // Log the raw message string as soon as it arrives
+        console.log('[BVR DEBUG] Raw message received from client:', message.toString());
+
         let isCommand = false;
         try {
             const data = JSON.parse(message.toString());
             isCommand = true;
             
             if (data.type === 'CONFIG') {
-                // **MODIFIED**: Add defensive checks for the data payload.
                 const payload = data.data || {};
-                const configData = payload.config || {}; // Default to empty object if missing
-
+                const configData = payload.config || {};
                 siteUrlForLogging = payload.site_url;
                 secretKeyForLogging = payload.api_secret;
-
                 const basePrompt = generateSystemPrompt(configData);
-                const agentName = configData.agent_name || 'Alex'; // Now safe to access
-
+                const agentName = configData.agent_name || 'Alex';
                 conversationHistory = [{ role: 'system', content: `${basePrompt} You must respond only in English.` }];
                 const welcomeMessage = `Hi there! My name is ${agentName}. How can I help you today? 👋`;
-                
                 if (ws.readyState === 1) {
                     ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: welcomeMessage }));
                 }
@@ -135,11 +123,10 @@ wss.on('connection', (ws) => {
             }
 
             if (conversationHistory.length === 0) {
-                 console.log('[WS] Ignoring message: Configuration not yet received.');
-                 return;
+                console.log('[WS] Ignoring message: Configuration not yet received.');
+                return;
             }
             
-            // Log the conversation on the first real message from the user
             if (!hasLoggedStart) {
                 hasLoggedStart = true;
                 await logConversationStart(siteUrlForLogging, secretKeyForLogging, connectionMode);

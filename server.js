@@ -148,7 +148,8 @@ async function getAIReply(history) {
     return chatCompletion.choices[0].message.content;
 }
 
-async function speakText(text, ws) {
+// ** MODIFIED **: Accepts a voice parameter from the client config
+async function speakText(text, ws, voice = 'nova') {
     if (!text || text.trim() === '') {
         console.log('[OpenAI TTS] Skipping empty text for speech synthesis.');
         return;
@@ -156,9 +157,9 @@ async function speakText(text, ws) {
     try {
         const mp3 = await openai.audio.speech.create({
             model: "tts-1",
-            voice: "nova",
+            voice: voice, // Use the selected voice
             input: text,
-            speed: 1.2 // ** MODIFIED: Speech speed is set to 20% faster **
+            speed: 1.2
         });
 
         const buffer = Buffer.from(await mp3.arrayBuffer());
@@ -194,6 +195,7 @@ wss.on('connection', (ws, req) => {
     let currentLanguage = 'en';
     let conversationHistory = [];
     let agentName = 'AI Support';
+    let ttsVoice = 'nova'; // Default voice
     const origin = req.headers.origin;
     const startTime = new Date();
 
@@ -215,13 +217,14 @@ wss.on('connection', (ws, req) => {
             if (data.type === 'CONFIG') {
                 const configData = data.data.config || {};
                 agentName = configData.agent_name || 'Alex';
+                ttsVoice = configData.tts_voice || 'nova'; // ** NEW: Get voice from config **
                 const basePrompt = generateSystemPrompt(configData);
                 conversationHistory = [{ role: 'system', content: `${basePrompt}\nYour name is ${agentName}.` }];
                 const welcomeMessage = `Hi there! My name is ${agentName}. How can I help you today? 👋`;
                 if (ws.readyState === 1) {
                     ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: welcomeMessage }));
                 }
-                console.log(`[WS] Config received. Agent: ${agentName}.`);
+                console.log(`[WS] Config received. Agent: ${agentName}. Voice: ${ttsVoice}.`);
                 return;
             }
 
@@ -261,7 +264,7 @@ wss.on('connection', (ws, req) => {
 
                 if (connectionMode === 'voice') {
                     ws.send(JSON.stringify({ type: 'AI_RESPONSE_PENDING_AUDIO', text: reply }));
-                    await speakText(reply, ws);
+                    await speakText(reply, ws, ttsVoice); // ** MODIFIED: Pass selected voice **
                 } else {
                     ws.send(JSON.stringify({ type: 'AI_IS_TYPING' }));
                     setTimeout(() => {

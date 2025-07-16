@@ -4,12 +4,14 @@ import fs from 'fs';
 import path from 'path';
 import { tmpdir } from 'os';
 import { OpenAI } from 'openai';
-import textToSpeech from '@google-cloud/text-to-speech';
 import dotenv from 'dotenv';
 import admin from 'firebase-admin';
 dotenv.config();
 
-// Initialize Firebase Admin (this part is unchanged)
+// ** REMOVED **: Google Cloud Text-to-Speech import is no longer needed.
+// import textToSpeech from '@google-cloud/text-to-speech';
+
+// Initialize Firebase Admin
 try {
     const serviceAccount = JSON.parse(process.env.FIREBASE_CREDENTIALS);
     admin.initializeApp({
@@ -17,7 +19,7 @@ try {
     });
     console.log('[Firebase] Admin SDK initialized successfully.');
 } catch (error) {
-    console.error('[Firebase] Failed to initialize Admin SDK. Check your FIREBASE_CREDENTIALS environment variable.', error.message);
+    console.error('[Firebase] Failed to initialize Admin SDK.', error.message);
 }
 const db = admin.firestore();
 
@@ -25,24 +27,9 @@ const app = express();
 app.use(express.json());
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-// ** MODIFIED: Simplified TTS Client initialization **
-// The library will automatically find the credentials from the GOOGLE_APPLICATION_CREDENTIALS environment variable.
-const ttsClient = new textToSpeech.TextToSpeechClient();
-console.log('[TTS] Client initialized.');
-
 const wss = new WebSocketServer({ noServer: true });
 
-// All other functions (generateSystemPrompt, analyzeConversation, etc.) are unchanged.
-// The rest of the file is identical to the previous version.
-
-const languageConfig = {
-    'en': { ttsCode: 'en-US', name: 'English' },
-    'es': { ttsCode: 'es-ES', name: 'Spanish' },
-    'fr': { ttsCode: 'fr-FR', name: 'French' },
-    'de': { ttsCode: 'de-DE', name: 'German' },
-    'ja': { ttsCode: 'ja-JP', name: 'Japanese' },
-};
+// ** REMOVED **: The ttsClient and languageConfig are no longer needed.
 
 function generateSystemPrompt(config) {
     const safeConfig = (config && typeof config === 'object') ? config : {};
@@ -166,21 +153,26 @@ async function getAIReply(history) {
     return chatCompletion.choices[0].message.content;
 }
 
-async function speakText(text, ws, langCode = 'en') {
-    if (!ttsClient) {
-        console.error("[TTS] Synthesis failed: TTS Client not available.");
+// ** MODIFIED **: This function now uses the OpenAI TTS API
+async function speakText(text, ws) {
+    if (!text || text.trim() === '') {
+        console.log('[OpenAI TTS] Skipping empty text for speech synthesis.');
         return;
     }
     try {
-        const config = languageConfig[langCode] || languageConfig['en'];
-        const [response] = await ttsClient.synthesizeSpeech({
-            input: { text },
-            voice: { languageCode: config.ttsCode, ssmlGender: 'NEUTRAL' },
-            audioConfig: { audioEncoding: 'MP3' },
+        const mp3 = await openai.audio.speech.create({
+            model: "tts-1",
+            voice: "nova", // You can choose from 'alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer'
+            input: text,
         });
-        if (ws.readyState === 1) ws.send(response.audioContent);
+
+        const buffer = Buffer.from(await mp3.arrayBuffer());
+        
+        if (ws.readyState === 1) {
+            ws.send(buffer);
+        }
     } catch (error) {
-        console.error('[TTS] Synthesis error:', error);
+        console.error('[OpenAI TTS] Synthesis error:', error);
     }
 }
 
@@ -245,14 +237,10 @@ wss.on('connection', (ws, req) => {
 
             let transcript = '';
 
+            // ** MODIFIED **: Language selection no longer affects TTS, only Whisper.
             if (data.type === 'SET_LANGUAGE') {
-                const langCode = data.language;
-                if (languageConfig[langCode] && conversationHistory.length > 0) {
-                    currentLanguage = langCode;
-                    const langName = languageConfig[langCode].name;
-                    conversationHistory[0].content = conversationHistory[0].content.replace(/You must respond only in \w+\./, `You must respond only in ${langName}.`);
-                    console.log(`[WS] Language set to: ${langName}`);
-                }
+                currentLanguage = data.language || 'en';
+                console.log(`[WS] Transcription language set to: ${currentLanguage}`);
                 return;
             }
 
@@ -280,7 +268,8 @@ wss.on('connection', (ws, req) => {
                     ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: reply }));
                 }
                 if (connectionMode === 'voice') {
-                    await speakText(reply, ws, currentLanguage);
+                    // ** MODIFIED **: The call to speakText no longer needs the language code.
+                    await speakText(reply, ws);
                 }
             }
         } catch (error) {

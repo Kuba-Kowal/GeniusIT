@@ -158,6 +158,7 @@ async function speakText(text, ws) {
             model: "tts-1",
             voice: "nova",
             input: text,
+            speed: 1.2 // ** MODIFIED: Speech speed is set to 20% faster **
         });
 
         const buffer = Buffer.from(await mp3.arrayBuffer());
@@ -259,14 +260,10 @@ wss.on('connection', (ws, req) => {
                 conversationHistory.push({ role: 'assistant', content: reply });
 
                 if (connectionMode === 'voice') {
-                    // Send text first with a special flag so the client knows to wait for audio.
                     ws.send(JSON.stringify({ type: 'AI_RESPONSE_PENDING_AUDIO', text: reply }));
-                    // Now, generate and send the audio.
                     await speakText(reply, ws);
                 } else {
-                    // In text mode, show typing indicator then send the response.
                     ws.send(JSON.stringify({ type: 'AI_IS_TYPING' }));
-                    // Simulate a small delay for typing effect
                     setTimeout(() => {
                         if (ws.readyState === 1) {
                             ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: reply }));

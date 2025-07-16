@@ -9,7 +9,7 @@ import dotenv from 'dotenv';
 import admin from 'firebase-admin';
 dotenv.config();
 
-// Initialize Firebase Admin
+// Initialize Firebase Admin (this part is unchanged)
 try {
     const serviceAccount = JSON.parse(process.env.FIREBASE_CREDENTIALS);
     admin.initializeApp({
@@ -25,8 +25,16 @@ const app = express();
 app.use(express.json());
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// ** MODIFIED: Simplified TTS Client initialization **
+// The library will automatically find the credentials from the GOOGLE_APPLICATION_CREDENTIALS environment variable.
 const ttsClient = new textToSpeech.TextToSpeechClient();
+console.log('[TTS] Client initialized.');
+
 const wss = new WebSocketServer({ noServer: true });
+
+// All other functions (generateSystemPrompt, analyzeConversation, etc.) are unchanged.
+// The rest of the file is identical to the previous version.
 
 const languageConfig = {
     'en': { ttsCode: 'en-US', name: 'English' },
@@ -47,7 +55,6 @@ function generateSystemPrompt(config) {
     return `You are a customer support live chat agent for ${companyName}. Your name is ${agentName}. You are friendly, professional, and empathetic. Your primary goal is to resolve customer issues efficiently and leave them with a positive impression of the company. Speak like a human support agent, not an AI. This means: Use short, clear sentences. Employ a conversational and friendly tone. Use contractions like "I'm," "you're," and "that's." Incorporate emojis where appropriate to convey tone, but do not overuse them. Be concise. Get straight to the point without unnecessary fluff or lengthy explanations. Your Core Responsibilities: Acknowledge and Empathize. Gather Information. Provide Solutions based on the company-specific information provided below. If you don't know the answer, politely ask the customer to hold while you check. Closing the Conversation: Once the issue is resolved, ask if there is anything else you can help with and wish them a good day. Company-Specific Information: Product/Service: ${productInfo}. Common Issues & Solutions:\n${issuesAndSolutions}. Escalation Protocol: If you cannot resolve the issue, state that you will create a ticket for the technical team.`;
 }
 
-// ** MODIFIED **: The AI analysis now also determines resolution status.
 async function analyzeConversation(history) {
     const transcript = history
         .filter(msg => msg.role === 'user' || msg.role === 'assistant')
@@ -79,7 +86,7 @@ async function analyzeConversation(history) {
         return {
             sentiment: analysis.sentiment || 'Unknown',
             subject: analysis.subject || 'No Subject',
-            resolution_status: analysis.resolution_status || 'Unknown' // Added resolution status
+            resolution_status: analysis.resolution_status || 'Unknown'
         };
     } catch (error) {
         console.error('[AI Analysis] Failed to analyze conversation:', error);
@@ -88,17 +95,28 @@ async function analyzeConversation(history) {
 }
 
 function slugify(text) {
-  return text.toString().toLowerCase().trim().replace(/\s+/g, '-').replace(/[^\w\-]+/g, '').replace(/\-\-+/g, '-');
+  return text
+    .toString()
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, '-')
+    .replace(/[^\w\-]+/g, '')
+    .replace(/\-\-+/g, '-');
 }
 
 async function logConversation(history, interactionType, origin, startTime) {
-    if (!db) { console.log('[Firestore] Database not initialized. Skipping log.'); return; }
-    if (history.length <= 2) { console.log('[Firestore] Conversation too short. Skipping log.'); return; }
+    if (!db) {
+        console.log('[Firestore] Database not initialized. Skipping log.');
+        return;
+    }
+    if (history.length <= 2) {
+        console.log('[Firestore] Conversation too short. Skipping log.');
+        return;
+    }
 
     try {
         const { sentiment, subject, resolution_status } = await analyzeConversation(history);
         
-        // ** MODIFIED **: Filter out the system message from the final transcript.
         const fullTranscript = history
             .filter(msg => msg.role !== 'system')
             .map(msg => `[${msg.role}] ${msg.content}`)
@@ -117,7 +135,7 @@ async function logConversation(history, interactionType, origin, startTime) {
             sentiment: sentiment,
             subject: subject,
             transcript: fullTranscript,
-            resolution_status: resolution_status // Added resolution status
+            resolution_status: resolution_status
         };
 
         await db.collection('conversations').doc(docId).set(conversationData);
@@ -149,6 +167,10 @@ async function getAIReply(history) {
 }
 
 async function speakText(text, ws, langCode = 'en') {
+    if (!ttsClient) {
+        console.error("[TTS] Synthesis failed: TTS Client not available.");
+        return;
+    }
     try {
         const config = languageConfig[langCode] || languageConfig['en'];
         const [response] = await ttsClient.synthesizeSpeech({
@@ -162,9 +184,25 @@ async function speakText(text, ws, langCode = 'en') {
     }
 }
 
+const ipConnections = new Map();
+const MAX_CONNECTIONS_PER_IP = 3;
+const MAX_AUDIO_BUFFER_SIZE_MB = 20;
+
 wss.on('connection', (ws, req) => {
-    console.log('[WS] New persistent connection established.');
+    const ip = req.socket.remoteAddress;
+    console.log(`[WS] New connection attempt from IP: ${ip}`);
+
+    const currentConnections = ipConnections.get(ip) || 0;
+    if (currentConnections >= MAX_CONNECTIONS_PER_IP) {
+        console.log(`[AUTH] IP ${ip} exceeded max connection limit. Connection rejected. 🛑`);
+        ws.terminate();
+        return;
+    }
+    ipConnections.set(ip, currentConnections + 1);
+    console.log(`[WS] Connection from ${ip} accepted. Current connections: ${currentConnections + 1}`);
+
     let audioBufferArray = [];
+    let currentAudioBufferSize = 0;
     let connectionMode = 'text';
     let currentLanguage = 'en';
     let conversationHistory = [];
@@ -175,6 +213,15 @@ wss.on('connection', (ws, req) => {
     ws.on('message', async (message) => {
         let isCommand = false;
         try {
+            if (Buffer.isBuffer(message)) {
+                currentAudioBufferSize += message.length;
+                if (currentAudioBufferSize > MAX_AUDIO_BUFFER_SIZE_MB * 1024 * 1024) {
+                    console.log(`[AUTH] Audio buffer limit exceeded for IP ${ip}. Terminating connection.`);
+                    ws.terminate();
+                    return;
+                }
+            }
+
             const data = JSON.parse(message.toString());
             isCommand = true;
             
@@ -218,6 +265,7 @@ wss.on('connection', (ws, req) => {
                 if (audioBufferArray.length === 0) return;
                 const completeAudioBuffer = Buffer.concat(audioBufferArray);
                 audioBufferArray = [];
+                currentAudioBufferSize = 0;
                 transcript = await transcribeWhisper(completeAudioBuffer, currentLanguage);
                 if (transcript && transcript.trim() && ws.readyState === 1) {
                     ws.send(JSON.stringify({ type: 'USER_TRANSCRIPT', text: transcript }));
@@ -236,13 +284,22 @@ wss.on('connection', (ws, req) => {
                 }
             }
         } catch (error) {
-            if (!isCommand && Buffer.isBuffer(message)) { audioBufferArray.push(message); } 
-            else { console.error('[Process] Error processing command:', error); }
+            if (!isCommand && Buffer.isBuffer(message)) {
+                audioBufferArray.push(message);
+            } else {
+                console.error('[Process] Error processing command:', error);
+            }
         }
     });
 
     ws.on('close', async () => {
-        console.log('[WS] Connection closed.');
+        console.log(`[WS] Connection from IP ${ip} closed.`);
+        const connections = (ipConnections.get(ip) || 1) - 1;
+        if (connections === 0) {
+            ipConnections.delete(ip);
+        } else {
+            ipConnections.set(ip, connections);
+        }
         await logConversation(conversationHistory, connectionMode, origin, startTime);
     });
 

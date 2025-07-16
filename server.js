@@ -8,9 +8,6 @@ import dotenv from 'dotenv';
 import admin from 'firebase-admin';
 dotenv.config();
 
-// ** REMOVED **: Google Cloud Text-to-Speech import is no longer needed.
-// import textToSpeech from '@google-cloud/text-to-speech';
-
 // Initialize Firebase Admin
 try {
     const serviceAccount = JSON.parse(process.env.FIREBASE_CREDENTIALS);
@@ -19,7 +16,7 @@ try {
     });
     console.log('[Firebase] Admin SDK initialized successfully.');
 } catch (error) {
-    console.error('[Firebase] Failed to initialize Admin SDK.', error.message);
+    console.error('[Firebase] Failed to initialize Admin SDK. Check your FIREBASE_CREDENTIALS environment variable.', error.message);
 }
 const db = admin.firestore();
 
@@ -28,8 +25,6 @@ app.use(express.json());
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const wss = new WebSocketServer({ noServer: true });
-
-// ** REMOVED **: The ttsClient and languageConfig are no longer needed.
 
 function generateSystemPrompt(config) {
     const safeConfig = (config && typeof config === 'object') ? config : {};
@@ -153,7 +148,6 @@ async function getAIReply(history) {
     return chatCompletion.choices[0].message.content;
 }
 
-// ** MODIFIED **: This function now uses the OpenAI TTS API
 async function speakText(text, ws) {
     if (!text || text.trim() === '') {
         console.log('[OpenAI TTS] Skipping empty text for speech synthesis.');
@@ -162,7 +156,7 @@ async function speakText(text, ws) {
     try {
         const mp3 = await openai.audio.speech.create({
             model: "tts-1",
-            voice: "nova", // You can choose from 'alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer'
+            voice: "nova",
             input: text,
         });
 
@@ -237,7 +231,6 @@ wss.on('connection', (ws, req) => {
 
             let transcript = '';
 
-            // ** MODIFIED **: Language selection no longer affects TTS, only Whisper.
             if (data.type === 'SET_LANGUAGE') {
                 currentLanguage = data.language || 'en';
                 console.log(`[WS] Transcription language set to: ${currentLanguage}`);
@@ -264,12 +257,21 @@ wss.on('connection', (ws, req) => {
                 conversationHistory.push({ role: 'user', content: transcript });
                 const reply = await getAIReply(conversationHistory);
                 conversationHistory.push({ role: 'assistant', content: reply });
-                if (ws.readyState === 1) {
-                    ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: reply }));
-                }
+
                 if (connectionMode === 'voice') {
-                    // ** MODIFIED **: The call to speakText no longer needs the language code.
+                    // Send text first with a special flag so the client knows to wait for audio.
+                    ws.send(JSON.stringify({ type: 'AI_RESPONSE_PENDING_AUDIO', text: reply }));
+                    // Now, generate and send the audio.
                     await speakText(reply, ws);
+                } else {
+                    // In text mode, show typing indicator then send the response.
+                    ws.send(JSON.stringify({ type: 'AI_IS_TYPING' }));
+                    // Simulate a small delay for typing effect
+                    setTimeout(() => {
+                        if (ws.readyState === 1) {
+                            ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: reply }));
+                        }
+                    }, 750);
                 }
             }
         } catch (error) {

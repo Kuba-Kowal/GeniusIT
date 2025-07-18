@@ -8,6 +8,12 @@ import dotenv from 'dotenv';
 import admin from 'firebase-admin';
 dotenv.config();
 
+// ** NEW: Environment Variable Validation **
+if (!process.env.FIREBASE_CREDENTIALS || !process.env.OPENAI_API_KEY || !process.env.ALLOWED_ORIGINS) {
+    console.error("FATAL ERROR: Missing required environment variables (FIREBASE_CREDENTIALS, OPENAI_API_KEY, ALLOWED_ORIGINS).");
+    process.exit(1);
+}
+
 // Initialize Firebase Admin
 try {
     const serviceAccount = JSON.parse(process.env.FIREBASE_CREDENTIALS);
@@ -17,6 +23,7 @@ try {
     console.log('[Firebase] Admin SDK initialized successfully.');
 } catch (error) {
     console.error('[Firebase] Failed to initialize Admin SDK. Check your FIREBASE_CREDENTIALS environment variable.', error.message);
+    process.exit(1);
 }
 const db = admin.firestore();
 
@@ -58,35 +65,27 @@ function generateSystemPrompt(config) {
     let issuesAndSolutions = (safeConfig.faqs && Array.isArray(safeConfig.faqs) && safeConfig.faqs.length > 0)
         ? safeConfig.faqs.filter(faq => faq && faq.issue && faq.solution).map(faq => `Issue: ${faq.issue}\nSolution: ${faq.solution}`).join('\n\n')
         : 'No common issues provided.';
-    return `You are a customer support live chat agent for ${companyName}. Your name is ${agentName}. You are friendly, professional, and empathetic. Your primary goal is to resolve customer issues efficiently and leave them with a positive impression of the company. Speak like a human support agent, not an AI. This means: Use short, clear sentences. Employ a conversational and friendly tone. Use contractions like "I'm," "you're," and "that's." Incorporate emojis where appropriate to convey tone, but do not overuse them. Be concise. Get straight to the point without unnecessary fluff or lengthy explanations. Your Core Responsibilities: Acknowledge and Empathize. Gather Information. Provide Solutions based on the company-specific information provided below. If you don't know the answer, politely ask the customer to hold while you check. Closing the Conversation: Once the issue is resolved, ask if there is anything else you can help with and wish them a good day. Company-Specific Information: Product/Service: ${productInfo}. Common Issues & Solutions:\n${issuesAndSolutions}. Escalation Protocol: If you cannot resolve the issue, state that you will create a ticket for the technical team.`;
+    return `You are a customer support live chat agent for ${companyName}. Your name is ${agentName}. You are friendly, professional, and empathetic. Your primary goal is to resolve customer issues efficiently.
+    IMPORTANT: Be concise. Keep your answers as short as possible while still being helpful. Use short, clear sentences. Use a conversational and friendly tone with contractions (I'm, you're, that's) and emojis where appropriate.
+    Your Core Responsibilities: Acknowledge and Empathize. Gather Information. Provide Solutions based on the company-specific information provided below.
+    Company-Specific Information:
+    - Product/Service: ${productInfo}.
+    - Common Issues & Solutions:\n${issuesAndSolutions}.
+    Escalation Protocol: If you cannot resolve the issue, state that you will create a ticket for the technical team.`;
 }
 
 async function analyzeConversation(history) {
-    const transcript = history
-        .filter(msg => msg.role === 'user' || msg.role === 'assistant')
-        .map(msg => `${msg.role}: ${msg.content}`)
-        .join('\n');
-
+    const transcript = history.filter(msg => msg.role === 'user' || msg.role === 'assistant').map(msg => `${msg.role}: ${msg.content}`).join('\n');
     if (!transcript) {
         return { sentiment: 'N/A', subject: 'Empty Conversation', resolution_status: 'N/A' };
     }
     try {
-        const analysisPrompt = `Analyze the following chat transcript. 
-        1. Determine the user's overall sentiment (one word: Positive, Negative, or Neutral).
-        2. Create a concise subject line (5 words or less).
-        3. Determine if the user's issue was resolved (one word: Resolved or Unresolved).
-        
-        Transcript:
-        ${transcript}
-
-        Return your answer as a single, valid JSON object with three keys: "sentiment", "subject", and "resolution_status".`;
-
+        const analysisPrompt = `Analyze the following chat transcript. Return your answer as a single, valid JSON object with three keys: "sentiment" (Positive, Negative, or Neutral), "subject" (5 words or less), and "resolution_status" (Resolved or Unresolved). Transcript:\n${transcript}`;
         const response = await openai.chat.completions.create({
             model: 'gpt-4o-mini',
             messages: [{ role: 'system', content: analysisPrompt }],
             response_format: { type: "json_object" }
         });
-
         const analysis = JSON.parse(response.choices[0].message.content);
         return {
             sentiment: analysis.sentiment || 'Unknown',
@@ -100,31 +99,16 @@ async function analyzeConversation(history) {
 }
 
 function slugify(text) {
-  return text
-    .toString()
-    .toLowerCase()
-    .trim()
-    .replace(/\s+/g, '-')
-    .replace(/[^\w\-]+/g, '')
-    .replace(/\-\-+/g, '-');
+    return text.toString().toLowerCase().trim().replace(/\s+/g, '-').replace(/[^\w\-]+/g, '').replace(/\-\-+/g, '-');
 }
 
 async function logConversation(history, interactionType, origin, startTime) {
-    if (!db || history.length <= 1) { // A conversation with only a system prompt isn't worth logging
-        return;
-    }
+    if (!db || history.length <= 1) return;
     try {
         const { sentiment, subject, resolution_status } = await analyzeConversation(history);
-        
-        const fullTranscript = history
-            .filter(msg => msg.role !== 'system')
-            .map(msg => {
-                if(msg.role === 'metadata') {
-                    return `[SYSTEM] ${msg.content}`;
-                }
-                return `[${msg.role}] ${msg.content}`;
-            })
-            .join('\n---\n');
+        const fullTranscript = history.filter(msg => msg.role !== 'system').map(msg => {
+            return msg.role === 'metadata' ? `[SYSTEM] ${msg.content}` : `[${msg.role}] ${msg.content}`;
+        }).join('\n---\n');
         
         if (!fullTranscript) {
             console.log('[Firestore] No user/assistant messages to log. Skipping.');
@@ -133,21 +117,15 @@ async function logConversation(history, interactionType, origin, startTime) {
 
         const date = new Date(startTime);
         const timestamp = `${date.getFullYear()}${(date.getMonth()+1).toString().padStart(2, '0')}${date.getDate().toString().padStart(2, '0')}-${date.getHours().toString().padStart(2, '0')}${date.getMinutes().toString().padStart(2, '0')}`;
-        const subjectSlug = slugify(subject);
-        const docId = `${timestamp}-${subjectSlug}`;
+        const docId = `${timestamp}-${slugify(subject)}`;
 
-        const conversationData = {
+        await db.collection('conversations').doc(docId).set({
             interaction_type: interactionType,
             origin: origin || 'unknown',
             start_time: startTime,
             end_time: admin.firestore.FieldValue.serverTimestamp(),
-            sentiment: sentiment,
-            subject: subject,
-            transcript: fullTranscript,
-            resolution_status: resolution_status
-        };
-
-        await db.collection('conversations').doc(docId).set(conversationData);
+            sentiment, subject, transcript: fullTranscript, resolution_status
+        });
         console.log(`[Firestore] Logged conversation with ID: "${docId}"`);
     } catch (error) {
         console.error('[Firestore] Failed to log conversation:', error.message);
@@ -175,16 +153,9 @@ async function getAIReply(history) {
 }
 
 async function speakText(text, ws, voice = 'nova') {
-    if (!text || text.trim() === '') {
-        return;
-    }
+    if (!text || text.trim() === '') return;
     try {
-        const mp3 = await openai.audio.speech.create({
-            model: "tts-1",
-            voice: voice,
-            input: text,
-            speed: 1.2
-        });
+        const mp3 = await openai.audio.speech.create({ model: "tts-1", voice, input: text, speed: 1.2 });
         const buffer = Buffer.from(await mp3.arrayBuffer());
         if (ws.readyState === 1) {
             ws.send(buffer);
@@ -209,13 +180,13 @@ wss.on('connection', (ws, req) => {
     ipConnections.set(ip, currentConnections + 1);
     console.log(`[WS] Connection from ${ip} accepted.`);
 
-    let audioBufferArray = [];
-    let currentAudioBufferSize = 0;
-    let connectionMode = 'text';
     let conversationHistory = [];
+    let connectionMode = 'text';
     let ttsVoice = 'nova';
     const origin = req.headers.origin;
     const startTime = new Date();
+    let audioBufferArray = [];
+    let currentAudioBufferSize = 0;
 
     ws.on('message', async (message) => {
         let isCommand = false;
@@ -227,28 +198,23 @@ wss.on('connection', (ws, req) => {
                     return;
                 }
             }
-
             const data = JSON.parse(message.toString());
             isCommand = true;
             
-            // The CONFIG message MUST be the first message to initialize the session.
             if (data.type === 'CONFIG') {
                 const configData = (data && data.data && data.data.config) ? data.data.config : {};
                 const agentName = configData.agent_name || 'AI Agent';
                 ttsVoice = configData.tts_voice || 'nova';
-                
                 const basePrompt = generateSystemPrompt(configData);
                 conversationHistory = [{ role: 'system', content: `${basePrompt}\nYour name is ${agentName}.` }];
-                
                 const welcomeMessage = `Hi there! My name is ${agentName}. How can I help you today? 👋`;
                 if (ws.readyState === 1) {
                     ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: welcomeMessage }));
                 }
                 console.log(`[WS] Session initialized for Agent: ${agentName}.`);
-                return; // Exit after handling config.
+                return;
             }
 
-            // ** NEW GUARD: If the session isn't initialized, ignore all other messages. **
             if (conversationHistory.length === 0) {
                 console.log('[WS] Ignoring message: Session not yet initialized with CONFIG.');
                 return;
@@ -268,14 +234,9 @@ wss.on('connection', (ws, req) => {
             }
 
             let transcript = '';
-            if (data.type === 'SET_LANGUAGE') {
-                // This is a non-critical message that can be ignored if it arrives before CONFIG.
-                // The guard above handles this.
-                return;
-            }
+            if (data.type === 'SET_LANGUAGE') { return; }
             if (data.type === 'INIT_VOICE') { connectionMode = 'voice'; return; }
             if (data.type === 'END_VOICE') { connectionMode = 'text'; return; }
-
             if (data.type === 'TEXT_MESSAGE') {
                 transcript = data.text;
             } else if (data.type === 'END_OF_STREAM') {
@@ -300,9 +261,7 @@ wss.on('connection', (ws, req) => {
                 } else {
                     ws.send(JSON.stringify({ type: 'AI_IS_TYPING' }));
                     setTimeout(() => {
-                        if (ws.readyState === 1) {
-                            ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: reply }));
-                        }
+                        if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: reply }));
                     }, 750);
                 }
             }
@@ -318,11 +277,8 @@ wss.on('connection', (ws, req) => {
     ws.on('close', async () => {
         console.log(`[WS] Connection from IP ${ip} closed.`);
         const connections = (ipConnections.get(ip) || 1) - 1;
-        if (connections === 0) {
-            ipConnections.delete(ip);
-        } else {
-            ipConnections.set(ip, connections);
-        }
+        if (connections === 0) ipConnections.delete(ip);
+        else ipConnections.set(ip, connections);
         await logConversation(conversationHistory, connectionMode, origin, startTime);
     });
 

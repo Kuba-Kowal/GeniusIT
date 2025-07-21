@@ -8,15 +8,13 @@ import dotenv from 'dotenv';
 import admin from 'firebase-admin';
 dotenv.config();
 
-// Version 13.1
+// Version 14.0
 
-// ** NEW: Environment Variable Validation **
 if (!process.env.FIREBASE_CREDENTIALS || !process.env.OPENAI_API_KEY || !process.env.ALLOWED_ORIGINS) {
     console.error("FATAL ERROR: Missing required environment variables (FIREBASE_CREDENTIALS, OPENAI_API_KEY, ALLOWED_ORIGINS).");
     process.exit(1);
 }
 
-// Initialize Firebase Admin
 try {
     const serviceAccount = JSON.parse(process.env.FIREBASE_CREDENTIALS);
     admin.initializeApp({
@@ -59,7 +57,7 @@ async function logSupportQuery(name, contact, message, origin) {
     }
 }
 
-function generateSystemPrompt(config) {
+function generateSystemPrompt(config, pageContext = {}, productData = []) {
     const safeConfig = (config && typeof config === 'object') ? config : {};
     const agentName = safeConfig.agent_name || 'Rohan';
     const companyName = safeConfig.company_name || 'the company';
@@ -67,22 +65,36 @@ function generateSystemPrompt(config) {
     let issuesAndSolutions = (safeConfig.faqs && Array.isArray(safeConfig.faqs) && safeConfig.faqs.length > 0)
         ? safeConfig.faqs.filter(faq => faq && faq.issue && faq.solution).map(faq => `Issue: ${faq.issue}\nSolution: ${faq.solution}`).join('\n\n')
         : 'No common issues provided.';
+    
+    let contextPrompt = '';
+    if (pageContext.url && pageContext.title) {
+        contextPrompt = `The user is currently on the page titled "${pageContext.title}" (${pageContext.url}). Tailor your answers to be relevant to this page if possible.`;
+    }
+
+    let woocommercePrompt = '';
+    if (productData.length > 0) {
+        const productList = productData.map(p => `- ${p.name} (Price: ${p.price}, URL: ${p.url}): ${p.description}`).join('\n');
+        woocommercePrompt = `You can also proactively recommend the following featured products if the user seems interested:\n${productList}`;
+    }
+
     return `You are a customer support live chat agent for ${companyName}. Your name is ${agentName}. You are friendly, professional, and empathetic. Your primary goal is to resolve customer issues efficiently.
     IMPORTANT: Be concise. Keep your answers as short as possible while still being helpful. Use short, clear sentences. Use a conversational and friendly tone with contractions (I'm, you're, that's) and emojis where appropriate.
+    ${contextPrompt}
     Your Core Responsibilities: Acknowledge and Empathize. Gather Information. Provide Solutions based on the company-specific information provided below.
     Company-Specific Information:
     - Product/Service: ${productInfo}.
     - Common Issues & Solutions:\n${issuesAndSolutions}.
+    ${woocommercePrompt}
     Escalation Protocol: If you cannot resolve the issue, state that you will create a ticket for the technical team.`;
 }
 
 async function analyzeConversation(history) {
     const transcript = history.filter(msg => msg.role === 'user' || msg.role === 'assistant').map(msg => `${msg.role}: ${msg.content}`).join('\n');
     if (!transcript) {
-        return { sentiment: 'N/A', subject: 'Empty Conversation', resolution_status: 'N/A' };
+        return { sentiment: 'N/A', subject: 'Empty Conversation', resolution_status: 'N/A', tags: [] };
     }
     try {
-        const analysisPrompt = `Analyze the following chat transcript. Return your answer as a single, valid JSON object with three keys: "sentiment" (Positive, Negative, or Neutral), "subject" (5 words or less), and "resolution_status" (Resolved or Unresolved). Transcript:\n${transcript}`;
+        const analysisPrompt = `Analyze the following chat transcript. Return your answer as a single, valid JSON object with four keys: "sentiment" (Positive, Negative, or Neutral), "subject" (5 words or less), "resolution_status" (Resolved or Unresolved), and "tags" (an array of 1-3 relevant keywords, e.g., ["shipping", "refund"]). Transcript:\n${transcript}`;
         const response = await openai.chat.completions.create({
             model: 'gpt-4o-mini',
             messages: [{ role: 'system', content: analysisPrompt }],
@@ -92,11 +104,12 @@ async function analyzeConversation(history) {
         return {
             sentiment: analysis.sentiment || 'Unknown',
             subject: analysis.subject || 'No Subject',
-            resolution_status: analysis.resolution_status || 'Unknown'
+            resolution_status: analysis.resolution_status || 'Unknown',
+            tags: analysis.tags || []
         };
     } catch (error) {
         console.error('[AI Analysis] Failed to analyze conversation:', error);
-        return { sentiment: 'Error', subject: 'Analysis Failed', resolution_status: 'Error' };
+        return { sentiment: 'Error', subject: 'Analysis Failed', resolution_status: 'Error', tags: [] };
     }
 }
 
@@ -107,7 +120,7 @@ function slugify(text) {
 async function logConversation(history, interactionType, origin, startTime) {
     if (!db || history.length <= 1) return;
     try {
-        const { sentiment, subject, resolution_status } = await analyzeConversation(history);
+        const { sentiment, subject, resolution_status, tags } = await analyzeConversation(history);
         const fullTranscript = history.filter(msg => msg.role !== 'system').map(msg => {
             return msg.role === 'metadata' ? `[SYSTEM] ${msg.content}` : `[${msg.role}] ${msg.content}`;
         }).join('\n---\n');
@@ -126,7 +139,7 @@ async function logConversation(history, interactionType, origin, startTime) {
             origin: origin || 'unknown',
             start_time: startTime,
             end_time: admin.firestore.FieldValue.serverTimestamp(),
-            sentiment, subject, transcript: fullTranscript, resolution_status
+            sentiment, subject, transcript: fullTranscript, resolution_status, tags
         });
         console.log(`[Firestore] Logged conversation with ID: "${docId}"`);
     } catch (error) {
@@ -206,11 +219,13 @@ wss.on('connection', (ws, req) => {
             if (data.type === 'CONFIG') {
                 const configData = (data.data && data.data.config) ? data.data.config : {};
                 const isProactive = (data.data && data.data.isProactive) ? data.data.isProactive : false;
+                const pageContext = (data.data && data.data.pageContext) ? data.data.pageContext : {};
+                const productData = (data.data && data.data.productData) ? data.data.productData : [];
 
                 const agentName = configData.agent_name || 'AI Agent';
                 ttsVoice = configData.tts_voice || 'nova';
-                const basePrompt = generateSystemPrompt(configData);
-                conversationHistory = [{ role: 'system', content: `${basePrompt}\nYour name is ${agentName}.` }];
+                const basePrompt = generateSystemPrompt(configData, pageContext, productData);
+                conversationHistory = [{ role: 'system', content: basePrompt }];
                 
                 let initialMessage = configData.welcome_message || `Hi there! My name is ${agentName}. How can I help you today? 👋`;
                 if (isProactive) {

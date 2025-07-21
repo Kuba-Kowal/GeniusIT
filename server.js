@@ -8,7 +8,7 @@ import dotenv from 'dotenv';
 import admin from 'firebase-admin';
 dotenv.config();
 
-// Version 14.1
+// Version 16.6
 
 if (!process.env.FIREBASE_CREDENTIALS || !process.env.OPENAI_API_KEY || !process.env.ALLOWED_ORIGINS) {
     console.error("FATAL ERROR: Missing required environment variables (FIREBASE_CREDENTIALS, OPENAI_API_KEY, ALLOWED_ORIGINS).");
@@ -62,7 +62,6 @@ function generateSystemPrompt(config, pageContext = {}, productData = []) {
     const agentName = safeConfig.agent_name || 'Rohan';
     const companyName = safeConfig.company_name || 'the company';
     
-    // UPDATED: Process structured product data
     let productInfo = 'No specific product information provided.';
     if (safeConfig.products && Array.isArray(safeConfig.products) && safeConfig.products.length > 0) {
         productInfo = 'Here is the list of our products and services:\n' + safeConfig.products
@@ -183,7 +182,8 @@ async function getAIReply(history) {
 async function speakText(text, ws, voice = 'nova') {
     if (!text || text.trim() === '') return;
     try {
-        const mp3 = await openai.audio.speech.create({ model: "tts-1", voice, input: text, speed: 1.2 });
+        // CHANGED: AI speech speed is now 1.15
+        const mp3 = await openai.audio.speech.create({ model: "tts-1", voice, input: text, speed: 1.15 });
         const buffer = Buffer.from(await mp3.arrayBuffer());
         if (ws.readyState === 1) {
             ws.send(buffer);
@@ -198,7 +198,7 @@ const MAX_CONNECTIONS_PER_IP = 3;
 const MAX_AUDIO_BUFFER_SIZE_MB = 20;
 
 wss.on('connection', (ws, req) => {
-    const ip = req.socket.remoteAddress;
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
     const currentConnections = ipConnections.get(ip) || 0;
     if (currentConnections >= MAX_CONNECTIONS_PER_IP) {
         console.log(`[AUTH] IP ${ip} exceeded max connection limit. Connection rejected.`);
@@ -217,107 +217,129 @@ wss.on('connection', (ws, req) => {
     let currentAudioBufferSize = 0;
 
     ws.on('message', async (message) => {
-        let isCommand = false;
-        try {
-            if (Buffer.isBuffer(message)) {
-                currentAudioBufferSize += message.length;
-                if (currentAudioBufferSize > MAX_AUDIO_BUFFER_SIZE_MB * 1024 * 1024) {
-                    ws.terminate();
-                    return;
-                }
-            }
-            const data = JSON.parse(message.toString());
-            isCommand = true;
-            
-            if (data.type === 'CONFIG') {
-                const configData = (data.data && data.data.config) ? data.data.config : {};
-                const isProactive = (data.data && data.data.isProactive) ? data.data.isProactive : false;
-                const pageContext = (data.data && data.data.pageContext) ? data.data.pageContext : {};
-                const productData = (data.data && data.data.productData) ? data.data.productData : [];
-
-                const agentName = configData.agent_name || 'AI Agent';
-                ttsVoice = configData.tts_voice || 'nova';
-                const basePrompt = generateSystemPrompt(configData, pageContext, productData);
-                conversationHistory = [{ role: 'system', content: basePrompt }];
-                
-                let initialMessage = configData.welcome_message || `Hi there! My name is ${agentName}. How can I help you today? 👋`;
-                if (isProactive) {
-                    initialMessage = configData.proactive_message || 'Hello! Have any questions? I am here to help.';
-                }
-                
-                conversationHistory.push({ role: 'assistant', content: initialMessage });
-
-                if (ws.readyState === 1) {
-                    ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: initialMessage }));
-                }
-                console.log(`[WS] Session initialized for Agent: ${agentName}. Proactive: ${isProactive}`);
+        if (Buffer.isBuffer(message)) {
+            currentAudioBufferSize += message.length;
+            if (currentAudioBufferSize > MAX_AUDIO_BUFFER_SIZE_MB * 1024 * 1024) {
+                console.log(`[WS] Terminating connection from ${ip} for exceeding audio buffer size.`);
+                ws.terminate();
                 return;
             }
+            audioBufferArray.push(message);
+            return;
+        }
 
-            if (conversationHistory.length === 0) {
+        try {
+            const data = JSON.parse(message.toString());
+
+            if (data.type !== 'CONFIG' && conversationHistory.length === 0) {
                 console.log('[WS] Ignoring message: Session not yet initialized with CONFIG.');
                 return;
             }
 
-            if (data.type === 'SUBMIT_LEAD_FORM') {
-                const { name, contact, message } = data.payload;
-                await logSupportQuery(name, contact, message, origin);
-                const leadInfoForTranscript = `Support query submitted. Name: ${name}, Contact: ${contact}, Message: ${message || 'N/A'}`;
-                conversationHistory.push({ role: 'metadata', content: leadInfoForTranscript });
-                const confirmationMessage = `Thank you, ${name}! Your request has been received. An agent will be in touch at ${contact} as soon as possible.`;
-                conversationHistory.push({ role: 'assistant', content: confirmationMessage });
-                if (ws.readyState === 1) {
-                    ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: confirmationMessage }));
-                }
-                return;
-            }
+            switch (data.type) {
+                case 'CONFIG': {
+                    const { config, isProactive, pageContext, productData } = data.data || {};
+                    const agentName = config.agent_name || 'AI Agent';
+                    ttsVoice = config.tts_voice || 'nova';
+                    const basePrompt = generateSystemPrompt(config, pageContext, productData);
+                    conversationHistory = [{ role: 'system', content: basePrompt }];
+                    
+                    let initialMessage = isProactive
+                        ? config.proactive_message || 'Hello! Have any questions? I am here to help.'
+                        : config.welcome_message || `Hi there! My name is ${agentName}. How can I help you today? 👋`;
+                    
+                    conversationHistory.push({ role: 'assistant', content: initialMessage });
 
-            let transcript = '';
-            if (data.type === 'SET_LANGUAGE') { return; }
-            if (data.type === 'INIT_VOICE') { connectionMode = 'voice'; return; }
-            if (data.type === 'END_VOICE') { connectionMode = 'text'; return; }
-            if (data.type === 'TEXT_MESSAGE') {
-                transcript = data.text;
-            } else if (data.type === 'END_OF_STREAM') {
-                if (audioBufferArray.length === 0) return;
-                const completeAudioBuffer = Buffer.concat(audioBufferArray);
-                audioBufferArray = [];
-                currentAudioBufferSize = 0;
-                transcript = await transcribeWhisper(completeAudioBuffer);
-                if (transcript && transcript.trim() && ws.readyState === 1) {
-                    ws.send(JSON.stringify({ type: 'USER_TRANSCRIPT', text: transcript }));
+                    if (ws.readyState === 1) {
+                        ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: initialMessage }));
+                    }
+                    console.log(`[WS] Session initialized for Agent: ${agentName}. Proactive: ${isProactive}`);
+                    break;
                 }
-            }
 
-            if (transcript && transcript.trim()) {
-                conversationHistory.push({ role: 'user', content: transcript });
-                const reply = await getAIReply(conversationHistory);
-                conversationHistory.push({ role: 'assistant', content: reply });
+                case 'TEXT_MESSAGE': {
+                    const transcript = data.text;
+                    if (transcript && transcript.trim()) {
+                        conversationHistory.push({ role: 'user', content: transcript });
+                        const reply = await getAIReply(conversationHistory);
+                        conversationHistory.push({ role: 'assistant', content: reply });
 
-                if (connectionMode === 'voice') {
-                    ws.send(JSON.stringify({ type: 'AI_RESPONSE_PENDING_AUDIO', text: reply }));
-                    await speakText(reply, ws, ttsVoice);
-                } else {
-                    ws.send(JSON.stringify({ type: 'AI_IS_TYPING' }));
-                    setTimeout(() => {
-                        if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: reply }));
-                    }, 750);
+                        ws.send(JSON.stringify({ type: 'AI_IS_TYPING' }));
+                        setTimeout(() => {
+                            if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: reply }));
+                        }, 750);
+                    }
+                    break;
                 }
+                
+                case 'INIT_VOICE':
+                    connectionMode = 'voice';
+                    break;
+
+                case 'END_VOICE':
+                    connectionMode = 'text';
+                    break;
+
+                case 'END_OF_STREAM': {
+                    if (audioBufferArray.length === 0) return;
+                    
+                    const completeAudioBuffer = Buffer.concat(audioBufferArray);
+                    audioBufferArray = [];
+                    currentAudioBufferSize = 0;
+                    
+                    const transcript = await transcribeWhisper(completeAudioBuffer);
+                    
+                    if (ws.readyState === 1) {
+                        ws.send(JSON.stringify({ type: 'USER_TRANSCRIPT', text: transcript }));
+                    }
+
+                    if (transcript && transcript.trim()) {
+                        conversationHistory.push({ role: 'user', content: transcript });
+                        const reply = await getAIReply(conversationHistory);
+                        conversationHistory.push({ role: 'assistant', content: reply });
+                        
+                        if (connectionMode === 'voice') {
+                            ws.send(JSON.stringify({ type: 'AI_RESPONSE_PENDING_AUDIO', text: reply }));
+                            await speakText(reply, ws, ttsVoice);
+                        } else {
+                            ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: reply }));
+                        }
+                    }
+                    break;
+                }
+
+                case 'SUBMIT_LEAD_FORM': {
+                    const { name, contact, message } = data.payload;
+                    await logSupportQuery(name, contact, message, origin);
+                    const leadInfoForTranscript = `Support query submitted. Name: ${name}, Contact: ${contact}, Message: ${message || 'N/A'}`;
+                    conversationHistory.push({ role: 'metadata', content: leadInfoForTranscript });
+                    
+                    const confirmationMessage = `Thank you, ${name}! Your request has been received. An agent will be in touch at ${contact} as soon as possible.`;
+                    conversationHistory.push({ role: 'assistant', content: confirmationMessage });
+                    
+                    if (ws.readyState === 1) {
+                        ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: confirmationMessage }));
+                    }
+                    break;
+                }
+
+                default:
+                    console.log(`[WS] Received unknown command type: ${data.type}`);
+                    break;
             }
         } catch (error) {
-            if (!isCommand && Buffer.isBuffer(message)) {
-                audioBufferArray.push(message);
-            } else {
-                console.error('[Process] Error processing command:', error);
-            }
+            console.error('[Process] Error processing command:', message.toString(), error);
         }
     });
 
     ws.on('close', async () => {
         console.log(`[WS] Connection from IP ${ip} closed.`);
         const connections = (ipConnections.get(ip) || 1) - 1;
-        if (connections === 0) ipConnections.delete(ip);
-        else ipConnections.set(ip, connections);
+        if (connections <= 0) {
+            ipConnections.delete(ip);
+        } else {
+            ipConnections.set(ip, connections);
+        }
         await logConversation(conversationHistory, connectionMode, origin, startTime);
     });
 
@@ -329,7 +351,7 @@ const server = app.listen(process.env.PORT || 3000, () => console.log(`[HTTP] Se
 server.on('upgrade', (req, socket, head) => {
     const origin = req.headers.origin;
     const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',');
-    if (allowedOrigins.includes(origin)) {
+    if (allowedOrigins.includes(origin) || process.env.NODE_ENV !== 'production') {
         wss.handleUpgrade(req, socket, head, (ws) => {
             wss.emit('connection', ws, req);
         });

@@ -8,7 +8,7 @@ import dotenv from 'dotenv';
 import admin from 'firebase-admin';
 dotenv.config();
 
-// Version 14.0
+// Version 14.1
 
 if (!process.env.FIREBASE_CREDENTIALS || !process.env.OPENAI_API_KEY || !process.env.ALLOWED_ORIGINS) {
     console.error("FATAL ERROR: Missing required environment variables (FIREBASE_CREDENTIALS, OPENAI_API_KEY, ALLOWED_ORIGINS).");
@@ -61,10 +61,19 @@ function generateSystemPrompt(config, pageContext = {}, productData = []) {
     const safeConfig = (config && typeof config === 'object') ? config : {};
     const agentName = safeConfig.agent_name || 'Rohan';
     const companyName = safeConfig.company_name || 'the company';
-    const productInfo = safeConfig.product_service_info || 'our products and services';
+    
+    // UPDATED: Process structured product data
+    let productInfo = 'No specific product information provided.';
+    if (safeConfig.products && Array.isArray(safeConfig.products) && safeConfig.products.length > 0) {
+        productInfo = 'Here is the list of our products and services:\n' + safeConfig.products
+            .filter(p => p && p.name)
+            .map(p => `- Name: ${p.name}\n  Price: ${p.price || 'N/A'}\n  Description: ${p.description || 'No description available.'}`)
+            .join('\n\n');
+    }
+
     let issuesAndSolutions = (safeConfig.faqs && Array.isArray(safeConfig.faqs) && safeConfig.faqs.length > 0)
-        ? safeConfig.faqs.filter(faq => faq && faq.issue && faq.solution).map(faq => `Issue: ${faq.issue}\nSolution: ${faq.solution}`).join('\n\n')
-        : 'No common issues provided.';
+        ? 'Common Issues & Solutions:\n' + safeConfig.faqs.filter(faq => faq && faq.issue && faq.solution).map(faq => `Issue: ${faq.issue}\nSolution: ${faq.solution}`).join('\n\n')
+        : '';
     
     let contextPrompt = '';
     if (pageContext.url && pageContext.title) {
@@ -74,17 +83,21 @@ function generateSystemPrompt(config, pageContext = {}, productData = []) {
     let woocommercePrompt = '';
     if (productData.length > 0) {
         const productList = productData.map(p => `- ${p.name} (Price: ${p.price}, URL: ${p.url}): ${p.description}`).join('\n');
-        woocommercePrompt = `You can also proactively recommend the following featured products if the user seems interested:\n${productList}`;
+        woocommercePrompt = `You can also reference the following featured WooCommerce products if relevant:\n${productList}`;
     }
 
     return `You are a customer support live chat agent for ${companyName}. Your name is ${agentName}. You are friendly, professional, and empathetic. Your primary goal is to resolve customer issues efficiently.
     IMPORTANT: Be concise. Keep your answers as short as possible while still being helpful. Use short, clear sentences. Use a conversational and friendly tone with contractions (I'm, you're, that's) and emojis where appropriate.
     ${contextPrompt}
     Your Core Responsibilities: Acknowledge and Empathize. Gather Information. Provide Solutions based on the company-specific information provided below.
+    
     Company-Specific Information:
-    - Product/Service: ${productInfo}.
-    - Common Issues & Solutions:\n${issuesAndSolutions}.
+    ${productInfo}
+    
+    ${issuesAndSolutions}
+    
     ${woocommercePrompt}
+
     Escalation Protocol: If you cannot resolve the issue, state that you will create a ticket for the technical team.`;
 }
 

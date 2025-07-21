@@ -8,6 +8,8 @@ import dotenv from 'dotenv';
 import admin from 'firebase-admin';
 dotenv.config();
 
+// Version 13.1
+
 // ** NEW: Environment Variable Validation **
 if (!process.env.FIREBASE_CREDENTIALS || !process.env.OPENAI_API_KEY || !process.env.ALLOWED_ORIGINS) {
     console.error("FATAL ERROR: Missing required environment variables (FIREBASE_CREDENTIALS, OPENAI_API_KEY, ALLOWED_ORIGINS).");
@@ -202,16 +204,25 @@ wss.on('connection', (ws, req) => {
             isCommand = true;
             
             if (data.type === 'CONFIG') {
-                const configData = (data && data.data && data.data.config) ? data.data.config : {};
+                const configData = (data.data && data.data.config) ? data.data.config : {};
+                const isProactive = (data.data && data.data.isProactive) ? data.data.isProactive : false;
+
                 const agentName = configData.agent_name || 'AI Agent';
                 ttsVoice = configData.tts_voice || 'nova';
                 const basePrompt = generateSystemPrompt(configData);
                 conversationHistory = [{ role: 'system', content: `${basePrompt}\nYour name is ${agentName}.` }];
-                const welcomeMessage = `Hi there! My name is ${agentName}. How can I help you today? 👋`;
-                if (ws.readyState === 1) {
-                    ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: welcomeMessage }));
+                
+                let initialMessage = configData.welcome_message || `Hi there! My name is ${agentName}. How can I help you today? 👋`;
+                if (isProactive) {
+                    initialMessage = configData.proactive_message || 'Hello! Have any questions? I am here to help.';
                 }
-                console.log(`[WS] Session initialized for Agent: ${agentName}.`);
+                
+                conversationHistory.push({ role: 'assistant', content: initialMessage });
+
+                if (ws.readyState === 1) {
+                    ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: initialMessage }));
+                }
+                console.log(`[WS] Session initialized for Agent: ${agentName}. Proactive: ${isProactive}`);
                 return;
             }
 

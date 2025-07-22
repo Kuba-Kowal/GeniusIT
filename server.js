@@ -6,38 +6,165 @@ import { tmpdir } from 'os';
 import { OpenAI } from 'openai';
 import dotenv from 'dotenv';
 import admin from 'firebase-admin';
+import { OAuth2Client } from 'google-auth-library';
+import { ProjectsClient } from '@google-cloud/resource-manager';
+import { FirebaseManagementClient } from '@google-cloud/firebase-management';
+
 dotenv.config();
 
-// Version 14.1
+// --- VARIABLE & CLIENT INITIALIZATION ---
 
-if (!process.env.FIREBASE_CREDENTIALS || !process.env.OPENAI_API_KEY || !process.env.ALLOWED_ORIGINS) {
-    console.error("FATAL ERROR: Missing required environment variables (FIREBASE_CREDENTIALS, OPENAI_API_KEY, ALLOWED_ORIGINS).");
-    process.exit(1);
+const REQUIRED_ENV = ['OPENAI_API_KEY', 'ALLOWED_ORIGINS', 'GOOGLE_OAUTH_CLIENT_ID', 'GOOGLE_OAUTH_CLIENT_SECRET', 'GOOGLE_OAUTH_REDIRECT_URI', 'WORDPRESS_ADMIN_URL'];
+for (const key of REQUIRED_ENV) {
+    if (!process.env[key]) {
+        console.error(`FATAL ERROR: Missing required environment variable ${key}.`);
+        process.exit(1);
+    }
 }
 
+let db;
 try {
-    const serviceAccount = JSON.parse(process.env.FIREBASE_CREDENTIALS);
-    admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount)
-    });
-    console.log('[Firebase] Admin SDK initialized successfully.');
+    if (process.env.FIREBASE_CREDENTIALS && process.env.FIREBASE_CREDENTIALS.trim() !== '') {
+        const serviceAccount = JSON.parse(process.env.FIREBASE_CREDENTIALS);
+        admin.initializeApp({
+            credential: admin.credential.cert(serviceAccount)
+        });
+        db = admin.firestore();
+        console.log('[Firebase] Admin SDK initialized from environment variable.');
+    } else {
+        console.log('[Firebase] FIREBASE_CREDENTIALS not found. Awaiting user provisioning.');
+    }
 } catch (error) {
-    console.error('[Firebase] Failed to initialize Admin SDK. Check your FIREBASE_CREDENTIALS environment variable.', error.message);
-    process.exit(1);
+    console.error('[Firebase] Failed to initialize Admin SDK from environment.', error.message);
 }
-const db = admin.firestore();
+
 
 const app = express();
 app.use(express.json());
-
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const server = app.listen(process.env.PORT || 3000, () => console.log(`[HTTP] Server listening on port ${process.env.PORT || 3000}`));
 const wss = new WebSocketServer({ noServer: true });
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const oauth2Client = new OAuth2Client(
+    process.env.GOOGLE_OAUTH_CLIENT_ID,
+    process.env.GOOGLE_OAUTH_CLIENT_SECRET,
+    process.env.GOOGLE_OAUTH_REDIRECT_URI
+);
+
+// --- FIREBASE PROVISIONING LOGIC ---
+
+async function provisionFirebase(userAuthClient) {
+    const resourceClient = new ProjectsClient({ auth: userAuthClient });
+    const firebaseClient = new FirebaseManagementClient({ auth: userAuthClient });
+
+    console.log('[Provisioning] Step 1: Finding or creating project...');
+    const projectDisplayName = 'My AI Chatbot Transcripts';
+    let [projects] = await resourceClient.searchProjects({ query: `displayName:"${projectDisplayName}"` });
+    let project = projects.find(p => p.displayName === projectDisplayName && p.state === 'ACTIVE');
+    
+    if (!project) {
+        console.log(`[Provisioning] No project found. Creating new project "${projectDisplayName}"...`);
+        const [operation] = await resourceClient.createProject({ project: { displayName: projectDisplayName }});
+        const [projectData] = await operation.promise();
+        project = { projectId: projectData.projectId };
+        console.log(`[Provisioning] Project created with ID: ${project.projectId}`);
+    } else {
+        console.log(`[Provisioning] Found existing project with ID: ${project.projectId}`);
+    }
+    const projectId = project.projectId;
+    const projectPath = `projects/${projectId}`;
+    
+    console.log('[Provisioning] Step 2: Adding Firebase to project...');
+    try {
+        await firebaseClient.addFirebase({ project: projectPath });
+        console.log('[Provisioning] Firebase added successfully.');
+    } catch (e) {
+        if (e.message.includes('Project already has a Firebase project')) {
+            console.log('[Provisioning] Firebase was already added to this project.');
+        } else { throw e; }
+    }
+    
+    console.log('[Provisioning] Step 3: Creating Firebase Web App...');
+    const webAppDisplayName = 'AI Chatbot Widget';
+    const [webApps] = await firebaseClient.listWebApps({ parent: projectPath });
+    let webApp = webApps.find(app => app.displayName === webAppDisplayName);
+    
+    if (!webApp) {
+        const [op] = await firebaseClient.createWebApp({ parent: projectPath, webApp: { displayName: webAppDisplayName }});
+        webApp = await op.promise();
+        console.log(`[Provisioning] Web App created with App ID: ${webApp.appId}`);
+    } else {
+        console.log(`[Provisioning] Found existing Web App with App ID: ${webApp.appId}`);
+    }
+
+    const [config] = await firebaseClient.getWebAppConfig({ name: `${webApp.name}/config` });
+
+    console.log('[Provisioning] Step 4: Creating Service Account for backend...');
+    const iamClient = new admin.auth.GoogleAuth({ auth: userAuthClient }).getIam();
+    const saDisplayName = 'ai-chatbot-server-account';
+    const saEmail = `${saDisplayName}@${projectId}.iam.gserviceaccount.com`;
+    
+    try {
+        await iamClient.projects.serviceAccounts.create({
+            name: projectPath,
+            requestBody: { accountId: saDisplayName, serviceAccount: { displayName: 'AI Chatbot Server' } }
+        });
+        console.log(`[Provisioning] Service Account created: ${saEmail}`);
+    } catch (e) {
+        if (e.message.includes('already exists')) {
+             console.log(`[Provisioning] Service Account already exists.`);
+        } else { throw e; }
+    }
+    
+    console.log('[Provisioning] Step 5: Generating Service Account key...');
+    const { data: keyData } = await iamClient.projects.serviceAccounts.keys.create({
+        name: `projects/${projectId}/serviceAccounts/${saEmail}`,
+    });
+    
+    const serviceAccountKey = JSON.parse(Buffer.from(keyData.privateKeyData, 'base64').toString('utf-8'));
+    console.log('[Provisioning] Service Account key generated.');
+
+    return { firebaseConfig: config, serviceAccount: serviceAccountKey };
+}
+
+
+// --- NEW OAUTH & PROVISIONING ENDPOINTS ---
+
+app.get('/auth/google', (req, res) => {
+    const authUrl = oauth2Client.generateAuthUrl({
+        access_type: 'offline',
+        scope: ['https://www.googleapis.com/auth/cloud-platform', 'https://www.googleapis.com/auth/firebase'],
+        prompt: 'consent'
+    });
+    res.redirect(authUrl);
+});
+
+app.get('/auth/google/callback', async (req, res) => {
+    const { code } = req.query;
+    try {
+        const { tokens } = await oauth2Client.getToken(code);
+        oauth2Client.setCredentials(tokens);
+
+        console.log('[OAuth] User authenticated. Starting Firebase provisioning...');
+        const credentials = await provisionFirebase(oauth2Client);
+        
+        const configString = Buffer.from(JSON.stringify(credentials.firebaseConfig)).toString('base64');
+        const saString = Buffer.from(JSON.stringify(credentials.serviceAccount)).toString('base64');
+        const successUrl = `${process.env.WORDPRESS_ADMIN_URL}&provision_status=success&config=${configString}&sa=${saString}`;
+        
+        res.redirect(successUrl);
+
+    } catch (error) {
+        console.error('[OAuth Callback] An error occurred:', error);
+        const errorUrl = `${process.env.WORDPRESS_ADMIN_URL}&provision_status=error&message=${encodeURIComponent(error.message)}`;
+        res.redirect(errorUrl);
+    }
+});
+
+
+// --- EXISTING CHATBOT & WEBSOCKET FUNCTIONS (UNCHANGED) ---
 
 async function logSupportQuery(name, contact, message, origin) {
-    if (!db) {
-        console.log('[Firestore] DB not init, skipping support query log.');
-        return;
-    }
+    if (!db) { console.log('[Firestore] DB not init, skipping support query log.'); return; }
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     const contact_type = emailRegex.test(contact) ? 'email' : 'phone';
     try {
@@ -62,7 +189,6 @@ function generateSystemPrompt(config, pageContext = {}, productData = []) {
     const agentName = safeConfig.agent_name || 'Rohan';
     const companyName = safeConfig.company_name || 'the company';
     
-    // UPDATED: Process structured product data
     let productInfo = 'No specific product information provided.';
     if (safeConfig.products && Array.isArray(safeConfig.products) && safeConfig.products.length > 0) {
         productInfo = 'Here is the list of our products and services:\n' + safeConfig.products
@@ -103,9 +229,7 @@ function generateSystemPrompt(config, pageContext = {}, productData = []) {
 
 async function analyzeConversation(history) {
     const transcript = history.filter(msg => msg.role === 'user' || msg.role === 'assistant').map(msg => `${msg.role}: ${msg.content}`).join('\n');
-    if (!transcript) {
-        return { sentiment: 'N/A', subject: 'Empty Conversation', resolution_status: 'N/A', tags: [] };
-    }
+    if (!transcript) { return { sentiment: 'N/A', subject: 'Empty Conversation', resolution_status: 'N/A', tags: [] }; }
     try {
         const analysisPrompt = `Analyze the following chat transcript. Return your answer as a single, valid JSON object with four keys: "sentiment" (Positive, Negative, or Neutral), "subject" (5 words or less), "resolution_status" (Resolved or Unresolved), and "tags" (an array of 1-3 relevant keywords, e.g., ["shipping", "refund"]). Transcript:\n${transcript}`;
         const response = await openai.chat.completions.create({
@@ -138,10 +262,7 @@ async function logConversation(history, interactionType, origin, startTime) {
             return msg.role === 'metadata' ? `[SYSTEM] ${msg.content}` : `[${msg.role}] ${msg.content}`;
         }).join('\n---\n');
         
-        if (!fullTranscript) {
-            console.log('[Firestore] No user/assistant messages to log. Skipping.');
-            return;
-        }
+        if (!fullTranscript) { console.log('[Firestore] No user/assistant messages to log. Skipping.'); return; }
 
         const date = new Date(startTime);
         const timestamp = `${date.getFullYear()}${(date.getMonth()+1).toString().padStart(2, '0')}${date.getDate().toString().padStart(2, '0')}-${date.getHours().toString().padStart(2, '0')}${date.getMinutes().toString().padStart(2, '0')}`;
@@ -185,9 +306,7 @@ async function speakText(text, ws, voice = 'nova') {
     try {
         const mp3 = await openai.audio.speech.create({ model: "tts-1", voice, input: text, speed: 1.13 });
         const buffer = Buffer.from(await mp3.arrayBuffer());
-        if (ws.readyState === 1) {
-            ws.send(buffer);
-        }
+        if (ws.readyState === 1) { ws.send(buffer); }
     } catch (error) {
         console.error('[OpenAI TTS] Synthesis error:', error);
     }
@@ -198,6 +317,12 @@ const MAX_CONNECTIONS_PER_IP = 3;
 const MAX_AUDIO_BUFFER_SIZE_MB = 20;
 
 wss.on('connection', (ws, req) => {
+    if (!db) {
+        ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: "I'm sorry, the chat service is not fully configured yet. Please ask the site administrator to complete the setup." }));
+        ws.close();
+        return;
+    }
+
     const ip = req.socket.remoteAddress;
     const currentConnections = ipConnections.get(ip) || 0;
     if (currentConnections >= MAX_CONNECTIONS_PER_IP) {
@@ -221,10 +346,7 @@ wss.on('connection', (ws, req) => {
         try {
             if (Buffer.isBuffer(message)) {
                 currentAudioBufferSize += message.length;
-                if (currentAudioBufferSize > MAX_AUDIO_BUFFER_SIZE_MB * 1024 * 1024) {
-                    ws.terminate();
-                    return;
-                }
+                if (currentAudioBufferSize > MAX_AUDIO_BUFFER_SIZE_MB * 1024 * 1024) { ws.terminate(); return; }
             }
             const data = JSON.parse(message.toString());
             isCommand = true;
@@ -241,23 +363,16 @@ wss.on('connection', (ws, req) => {
                 conversationHistory = [{ role: 'system', content: basePrompt }];
                 
                 let initialMessage = configData.welcome_message || `Hi there! My name is ${agentName}. How can I help you today? 👋`;
-                if (isProactive) {
-                    initialMessage = configData.proactive_message || 'Hello! Have any questions? I am here to help.';
-                }
+                if (isProactive) { initialMessage = configData.proactive_message || 'Hello! Have any questions? I am here to help.'; }
                 
                 conversationHistory.push({ role: 'assistant', content: initialMessage });
 
-                if (ws.readyState === 1) {
-                    ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: initialMessage }));
-                }
+                if (ws.readyState === 1) { ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: initialMessage })); }
                 console.log(`[WS] Session initialized for Agent: ${agentName}. Proactive: ${isProactive}`);
                 return;
             }
 
-            if (conversationHistory.length === 0) {
-                console.log('[WS] Ignoring message: Session not yet initialized with CONFIG.');
-                return;
-            }
+            if (conversationHistory.length === 0) { console.log('[WS] Ignoring message: Session not yet initialized with CONFIG.'); return; }
 
             if (data.type === 'SUBMIT_LEAD_FORM') {
                 const { name, contact, message } = data.payload;
@@ -266,9 +381,7 @@ wss.on('connection', (ws, req) => {
                 conversationHistory.push({ role: 'metadata', content: leadInfoForTranscript });
                 const confirmationMessage = `Thank you, ${name}! Your request has been received. An agent will be in touch at ${contact} as soon as possible.`;
                 conversationHistory.push({ role: 'assistant', content: confirmationMessage });
-                if (ws.readyState === 1) {
-                    ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: confirmationMessage }));
-                }
+                if (ws.readyState === 1) { ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: confirmationMessage })); }
                 return;
             }
 
@@ -284,9 +397,7 @@ wss.on('connection', (ws, req) => {
                 audioBufferArray = [];
                 currentAudioBufferSize = 0;
                 transcript = await transcribeWhisper(completeAudioBuffer);
-                if (transcript && transcript.trim() && ws.readyState === 1) {
-                    ws.send(JSON.stringify({ type: 'USER_TRANSCRIPT', text: transcript }));
-                }
+                if (transcript && transcript.trim() && ws.readyState === 1) { ws.send(JSON.stringify({ type: 'USER_TRANSCRIPT', text: transcript })); }
             }
 
             if (transcript && transcript.trim()) {
@@ -305,11 +416,8 @@ wss.on('connection', (ws, req) => {
                 }
             }
         } catch (error) {
-            if (!isCommand && Buffer.isBuffer(message)) {
-                audioBufferArray.push(message);
-            } else {
-                console.error('[Process] Error processing command:', error);
-            }
+            if (!isCommand && Buffer.isBuffer(message)) { audioBufferArray.push(message); } 
+            else { console.error('[Process] Error processing command:', error); }
         }
     });
 
@@ -324,7 +432,8 @@ wss.on('connection', (ws, req) => {
     ws.on('error', (err) => console.error('[WS] Connection error:', err));
 });
 
-const server = app.listen(process.env.PORT || 3000, () => console.log(`[HTTP] Server listening on port ${process.env.PORT || 3000}`));
+
+// --- WEBSOCKET UPGRADE ---
 
 server.on('upgrade', (req, socket, head) => {
     const origin = req.headers.origin;

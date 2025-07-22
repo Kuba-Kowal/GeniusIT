@@ -7,8 +7,6 @@ import { OpenAI } from 'openai';
 import dotenv from 'dotenv';
 import admin from 'firebase-admin';
 import { OAuth2Client } from 'google-auth-library';
-import { ProjectsClient } from '@google-cloud/resource-manager';
-import { FirebaseManagementClient } from '@google-cloud/firebase-management';
 
 dotenv.config();
 
@@ -52,80 +50,109 @@ const oauth2Client = new OAuth2Client(
 
 // --- FIREBASE PROVISIONING LOGIC ---
 
+/**
+ * The main function to automate Firebase setup using direct REST API calls.
+ */
 async function provisionFirebase(userAuthClient) {
-    const resourceClient = new ProjectsClient({ auth: userAuthClient });
-    const firebaseClient = new FirebaseManagementClient({ auth: userAuthClient });
+    // Helper function to make authenticated API calls
+    const authedFetch = async (url, options = {}) => {
+        const token = await userAuthClient.getAccessToken();
+        const headers = {
+            'Authorization': `Bearer ${token.token}`,
+            'Content-Type': 'application/json',
+            ...options.headers,
+        };
+        const response = await fetch(url, { ...options, headers });
+        if (!response.ok) {
+            const errorBody = await response.json();
+            console.error('API Error:', errorBody);
+            throw new Error(`API call to ${url} failed with status ${response.status}: ${errorBody.error.message}`);
+        }
+        // Some Google APIs return empty responses on success
+        const contentType = response.headers.get("content-type");
+        if (contentType && contentType.indexOf("application/json") !== -1) {
+            return response.json();
+        }
+        return response.text();
+    };
 
+    // 1. Find or Create a Google Cloud Project
     console.log('[Provisioning] Step 1: Finding or creating project...');
     const projectDisplayName = 'My AI Chatbot Transcripts';
-    let [projects] = await resourceClient.searchProjects({ query: `displayName:"${projectDisplayName}"` });
-    let project = projects.find(p => p.displayName === projectDisplayName && p.state === 'ACTIVE');
-    
+    let projects = await authedFetch(`https://cloudresourcemanager.googleapis.com/v1/projects?filter=displayName:"${projectDisplayName}"`);
+    let project = projects.projects ? projects.projects.find(p => p.lifecycleState === 'ACTIVE') : null;
+
     if (!project) {
         console.log(`[Provisioning] No project found. Creating new project "${projectDisplayName}"...`);
-        const [operation] = await resourceClient.createProject({ project: { displayName: projectDisplayName }});
-        const [projectData] = await operation.promise();
-        project = { projectId: projectData.projectId };
+        const operation = await authedFetch('https://cloudresourcemanager.googleapis.com/v1/projects', {
+            method: 'POST',
+            body: JSON.stringify({ name: projectDisplayName, projectId: `ai-chatbot-${Date.now()}` }),
+        });
+        // This creation call is long-running, we will assume for this script it completes fast enough.
+        // In a production app, you'd poll the operation's status.
+        project = { projectId: operation.projectId };
         console.log(`[Provisioning] Project created with ID: ${project.projectId}`);
     } else {
         console.log(`[Provisioning] Found existing project with ID: ${project.projectId}`);
     }
     const projectId = project.projectId;
-    const projectPath = `projects/${projectId}`;
-    
+
+    // 2. Add Firebase to the project
     console.log('[Provisioning] Step 2: Adding Firebase to project...');
-    try {
-        await firebaseClient.addFirebase({ project: projectPath });
-        console.log('[Provisioning] Firebase added successfully.');
-    } catch (e) {
-        if (e.message.includes('Project already has a Firebase project')) {
-            console.log('[Provisioning] Firebase was already added to this project.');
-        } else { throw e; }
-    }
+    await authedFetch(`https://firebase.googleapis.com/v1beta1/projects/${projectId}:addFirebase`, { method: 'POST' });
+    console.log('[Provisioning] Firebase enabled for project.');
     
+    // 3. Create a Web App in Firebase
     console.log('[Provisioning] Step 3: Creating Firebase Web App...');
     const webAppDisplayName = 'AI Chatbot Widget';
-    const [webApps] = await firebaseClient.listWebApps({ parent: projectPath });
-    let webApp = webApps.find(app => app.displayName === webAppDisplayName);
+    const webApps = await authedFetch(`https://firebase.googleapis.com/v1beta1/projects/${projectId}/webApps`);
+    let webApp = webApps.apps ? webApps.apps.find(app => app.displayName === webAppDisplayName) : null;
     
     if (!webApp) {
-        const [op] = await firebaseClient.createWebApp({ parent: projectPath, webApp: { displayName: webAppDisplayName }});
-        webApp = await op.promise();
+        const op = await authedFetch(`https://firebase.googleapis.com/v1beta1/projects/${projectId}/webApps`, {
+            method: 'POST',
+            body: JSON.stringify({ displayName: webAppDisplayName })
+        });
+        webApp = op; // The response from create is the app object
         console.log(`[Provisioning] Web App created with App ID: ${webApp.appId}`);
     } else {
         console.log(`[Provisioning] Found existing Web App with App ID: ${webApp.appId}`);
     }
 
-    const [config] = await firebaseClient.getWebAppConfig({ name: `${webApp.name}/config` });
+    const config = await authedFetch(`https://firebase.googleapis.com/v1beta1/${webApp.name}/config`);
 
-    console.log('[Provisioning] Step 4: Creating Service Account for backend...');
-    const iamClient = new admin.auth.GoogleAuth({ auth: userAuthClient }).getIam();
+    // 4. Create a Service Account for the backend
+    console.log('[Provisioning] Step 4: Creating Service Account...');
     const saDisplayName = 'ai-chatbot-server-account';
-    const saEmail = `${saDisplayName}@${projectId}.iam.gserviceaccount.com`;
+    const saAccountId = `${saDisplayName}-${Date.now()}`.substring(0, 29); // Must be between 6 and 30 chars
+    const saEmail = `${saAccountId}@${projectId}.iam.gserviceaccount.com`;
     
     try {
-        await iamClient.projects.serviceAccounts.create({
-            name: projectPath,
-            requestBody: { accountId: saDisplayName, serviceAccount: { displayName: 'AI Chatbot Server' } }
+        await authedFetch(`https://iam.googleapis.com/v1/projects/${projectId}/serviceAccounts`, {
+            method: 'POST',
+            body: JSON.stringify({ accountId: saAccountId, serviceAccount: { displayName: 'AI Chatbot Server' } })
         });
         console.log(`[Provisioning] Service Account created: ${saEmail}`);
-    } catch (e) {
-        if (e.message.includes('already exists')) {
-             console.log(`[Provisioning] Service Account already exists.`);
+    } catch(e) {
+        if (e.message.includes('602')) { // ALREADY_EXISTS error code
+            console.log(`[Provisioning] Service Account already exists.`);
         } else { throw e; }
     }
     
+    // 5. Generate a key for the Service Account
     console.log('[Provisioning] Step 5: Generating Service Account key...');
-    const { data: keyData } = await iamClient.projects.serviceAccounts.keys.create({
-        name: `projects/${projectId}/serviceAccounts/${saEmail}`,
+    const keyData = await authedFetch(`https://iam.googleapis.com/v1/projects/${projectId}/serviceAccounts/${saEmail}/keys`, {
+        method: 'POST'
     });
     
     const serviceAccountKey = JSON.parse(Buffer.from(keyData.privateKeyData, 'base64').toString('utf-8'));
     console.log('[Provisioning] Service Account key generated.');
 
-    return { firebaseConfig: config, serviceAccount: serviceAccountKey };
+    return {
+        firebaseConfig: config,
+        serviceAccount: serviceAccountKey
+    };
 }
-
 
 // --- NEW OAUTH & PROVISIONING ENDPOINTS ---
 

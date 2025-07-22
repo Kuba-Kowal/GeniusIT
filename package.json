@@ -10,12 +10,10 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@google-cloud/firebase-management": "^1.1.0",
-    "@google-cloud/resource-manager": "^5.2.0",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "firebase-admin": "^12.1.1",
-    "google-auth-library": "^9.11.0",
+    "google-auth-library": "^10.1.0",
     "openai": "^4.52.0",
     "ws": "^8.17.1"
   }

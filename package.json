@@ -1,18 +1,22 @@
 {
-  "name": "twilio-voice-ai-server",
-  "version": "1.0.0",
-  "description": "Node.js server for voice AI processing.",
+  "name": "ai-chatbot-server",
+  "version": "2.0.0",
+  "description": "Node.js backend for the Conversational AI WordPress plugin, including WebSocket server and Firebase provisioning.",
   "main": "server.js",
   "type": "module",
   "scripts": {
     "start": "node server.js"
   },
+  "author": "",
+  "license": "ISC",
   "dependencies": {
-    "@google-cloud/text-to-speech": "^5.3.0",
+    "@google-cloud/firebase-management": "^1.1.0",
+    "@google-cloud/resource-manager": "^5.2.0",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "openai": "^4.52.7",
-    "firebase-admin": "^12.2.0",
-    "ws": "^8.18.0"
+    "firebase-admin": "^12.1.1",
+    "google-auth-library": "^9.11.0",
+    "openai": "^4.52.0",
+    "ws": "^8.17.1"
   }
 }

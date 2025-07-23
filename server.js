@@ -72,8 +72,8 @@ async function provisionFirebase(userAuthClient) {
     console.log(`[Provisioning] Project creation initiated with ID: ${projectId}`);
     
     // --- THE FIX: Wait 15 seconds for the new project to be ready across Google's systems ---
-    console.log('[Provisioning] Waiting 15 seconds for project to propagate...');
-    await sleep(15000);
+    console.log('[Provisioning] Waiting 60 seconds for project to propagate...');
+    await sleep(60000);
     console.log('[Provisioning] Resuming process...');
     // --- END FIX ---
 

@@ -40,23 +40,23 @@ const oauth2Client = new OAuth2Client(
     process.env.GOOGLE_OAUTH_REDIRECT_URI
 );
 
-// --- NEW POLLING HELPER FUNCTION ---
-const pollOperation = async (operation, userAuthClient) => {
+// --- UPDATED POLLING HELPER FUNCTION ---
+const pollOperation = async (operationName, apiBaseUrl, userAuthClient) => {
     let isDone = false;
     let operationData;
-    console.log(`[Polling] -> Waiting for operation: ${operation.name}`);
+    console.log(`[Polling] -> Waiting for operation: ${operationName}`);
     
     while (!isDone) {
         await sleep(4000); // Wait 4 seconds between checks
         
-        const response = await fetch(`https://firebase.googleapis.com/v1beta1/${operation.name}`, {
+        const response = await fetch(`${apiBaseUrl}/${operationName}`, {
             headers: { 'Authorization': `Bearer ${(await userAuthClient.getAccessToken()).token}` }
         });
         
         const data = await response.json();
 
         if (data.done) {
-            console.log(`[Polling] <- Operation ${operation.name} complete.`);
+            console.log(`[Polling] <- Operation ${operationName} complete.`);
             isDone = true;
             operationData = data;
         } else {
@@ -82,7 +82,6 @@ async function provisionFirebase(userAuthClient) {
             console.error('Google API Error:', JSON.stringify(errorBody, null, 2));
             throw new Error(`API call to ${url} failed with status ${response.status}: ${errorBody.error.message}`);
         }
-        // Always expect JSON from these Google APIs
         return response.json();
     };
 
@@ -114,7 +113,8 @@ async function provisionFirebase(userAuthClient) {
         method: 'POST',
         body: JSON.stringify({ locationId: 'nam5', type: 'FIRESTORE_NATIVE' })
     });
-    await pollOperation(dbOperation, userAuthClient); // Wait for database creation to finish
+    // Use the correct API base URL for polling
+    await pollOperation(dbOperation.name, 'https://firestore.googleapis.com/v1', userAuthClient);
     console.log('[Provisioning] Firestore Database created and ready.');
     
     console.log('[Provisioning] Step 3: Creating Firebase Web App...');
@@ -122,8 +122,9 @@ async function provisionFirebase(userAuthClient) {
         method: 'POST',
         body: JSON.stringify({ displayName: 'AI Chatbot Widget' })
     });
-    const completedWebAppOperation = await pollOperation(webAppOperation, userAuthClient);
-    const webApp = completedWebAppOperation.response; // The actual app data is in the 'response' field
+    // Use the correct API base URL for polling
+    const completedWebAppOperation = await pollOperation(webAppOperation.name, 'https://firebase.googleapis.com/v1beta1', userAuthClient);
+    const webApp = completedWebAppOperation.response;
     console.log(`[Provisioning] Web App created with App ID: ${webApp.appId}`);
 
     console.log('[Provisioning] Step 4: Creating Service Account...');

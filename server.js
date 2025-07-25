@@ -78,7 +78,6 @@ async function provisionFirebase(userAuthClient) {
     await authedFetch(`https://firebase.googleapis.com/v1beta1/projects/${projectId}:addFirebase`, { method: 'POST' });
     console.log('[Provisioning] Firebase enabled for project.');
     
-    // --- NEW FIX: Explicitly enable the Firestore API before using it ---
     console.log('[Provisioning] Step 2.1: Enabling Firestore API...');
     await authedFetch(`https://serviceusage.googleapis.com/v1/projects/${projectId}/services/firestore.googleapis.com:enable`, {
         method: 'POST'
@@ -87,13 +86,12 @@ async function provisionFirebase(userAuthClient) {
 
     console.log('[Provisioning] Waiting 10 seconds for API to be ready...');
     await sleep(10000); 
-    // --- END NEW FIX ---
-
+    
     console.log('[Provisioning] Step 2.5: Creating Firestore Database...');
     await authedFetch(`https://firestore.googleapis.com/v1/projects/${projectId}/databases?databaseId=(default)`, {
         method: 'POST',
         body: JSON.stringify({
-            locationId: 'us-central', // You can change this to a region closer to you
+            locationId: 'nam5', // Corrected from 'us-central' to 'nam5' (North America Multi-Region)
             type: 'FIRESTORE_NATIVE'
         })
     });

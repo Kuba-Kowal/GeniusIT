@@ -78,7 +78,17 @@ async function provisionFirebase(userAuthClient) {
     await authedFetch(`https://firebase.googleapis.com/v1beta1/projects/${projectId}:addFirebase`, { method: 'POST' });
     console.log('[Provisioning] Firebase enabled for project.');
     
-    // --- THE FIX: Create a Firestore database instance before creating a web app ---
+    // --- NEW FIX: Explicitly enable the Firestore API before using it ---
+    console.log('[Provisioning] Step 2.1: Enabling Firestore API...');
+    await authedFetch(`https://serviceusage.googleapis.com/v1/projects/${projectId}/services/firestore.googleapis.com:enable`, {
+        method: 'POST'
+    });
+    console.log('[Provisioning] Firestore API enabled.');
+
+    console.log('[Provisioning] Waiting 10 seconds for API to be ready...');
+    await sleep(10000); 
+    // --- END NEW FIX ---
+
     console.log('[Provisioning] Step 2.5: Creating Firestore Database...');
     await authedFetch(`https://firestore.googleapis.com/v1/projects/${projectId}/databases?databaseId=(default)`, {
         method: 'POST',
@@ -88,7 +98,6 @@ async function provisionFirebase(userAuthClient) {
         })
     });
     console.log('[Provisioning] Firestore Database created.');
-    // --- END FIX ---
 
     console.log('[Provisioning] Waiting 10 seconds for database to initialize...');
     await sleep(10000);

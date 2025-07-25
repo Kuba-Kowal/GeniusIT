@@ -71,15 +71,27 @@ async function provisionFirebase(userAuthClient) {
     });
     console.log(`[Provisioning] Project creation initiated with ID: ${projectId}`);
     
-    // --- THE FIX: Wait 15 seconds for the new project to be ready across Google's systems ---
-    console.log('[Provisioning] Waiting 60 seconds for project to propagate...');
-    await sleep(60000);
-    console.log('[Provisioning] Resuming process...');
-    // --- END FIX ---
+    console.log('[Provisioning] Waiting 15 seconds for project to propagate...');
+    await sleep(15000);
 
     console.log('[Provisioning] Step 2: Adding Firebase to project...');
     await authedFetch(`https://firebase.googleapis.com/v1beta1/projects/${projectId}:addFirebase`, { method: 'POST' });
     console.log('[Provisioning] Firebase enabled for project.');
+    
+    // --- THE FIX: Create a Firestore database instance before creating a web app ---
+    console.log('[Provisioning] Step 2.5: Creating Firestore Database...');
+    await authedFetch(`https://firestore.googleapis.com/v1/projects/${projectId}/databases?databaseId=(default)`, {
+        method: 'POST',
+        body: JSON.stringify({
+            locationId: 'us-central', // You can change this to a region closer to you
+            type: 'FIRESTORE_NATIVE'
+        })
+    });
+    console.log('[Provisioning] Firestore Database created.');
+    // --- END FIX ---
+
+    console.log('[Provisioning] Waiting 10 seconds for database to initialize...');
+    await sleep(10000);
     
     console.log('[Provisioning] Step 3: Creating Firebase Web App...');
     const webAppDisplayName = 'AI Chatbot Widget';
@@ -99,7 +111,6 @@ async function provisionFirebase(userAuthClient) {
     });
     console.log(`[Provisioning] Service Account created: ${saEmail}`);
     
-    // It can also take a moment for the new service account to be ready. Add a small pause.
     console.log('[Provisioning] Waiting 5 seconds for service account to be ready...');
     await sleep(5000);
     
@@ -133,7 +144,7 @@ app.get('/auth/google/callback', async (req, res) => {
         oauth2Client.setCredentials(tokens);
 
         console.log('[OAuth] User authenticated. Starting Firebase provisioning...');
-        const credentials = await provisionFirebase(oauth2Client);
+        const credentials = await provisionFirebase(userAuthClient);
         
         const apiKey = `bvr_${crypto.randomBytes(24).toString('hex')}`;
         

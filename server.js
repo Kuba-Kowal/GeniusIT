@@ -144,7 +144,7 @@ app.get('/auth/google/callback', async (req, res) => {
         oauth2Client.setCredentials(tokens);
 
         console.log('[OAuth] User authenticated. Starting Firebase provisioning...');
-        const credentials = await provisionFirebase(userAuthClient);
+        const credentials = await provisionFirebase(oauth2Client);
         
         const apiKey = `bvr_${crypto.randomBytes(24).toString('hex')}`;
         

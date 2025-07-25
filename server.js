@@ -137,7 +137,7 @@ async function provisionFirebase(userAuthClient) {
     console.log(`[Provisioning] Service Account created: ${saEmail}`);
     
     console.log('[Provisioning] Waiting 5 seconds for service account to be ready...');
-    await sleep(5000);
+    await sleep(15000);
     
     console.log('[Provisioning] Step 5: Generating Service Account key...');
     const keyData = await authedFetch(`https://iam.googleapis.com/v1/projects/${projectId}/serviceAccounts/${saEmail}/keys`, {

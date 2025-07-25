@@ -95,7 +95,7 @@ async function provisionFirebase(userAuthClient) {
     console.log(`[Provisioning] Project creation initiated with ID: ${projectId}`);
 
     console.log('[Provisioning] Waiting 30 seconds for project to propagate...');
-    await sleep(30000); // Increased from 15000 to 30000
+    await sleep(30000);
 
     console.log('[Provisioning] Step 1.5: Enabling Firebase Management API...');
     await authedFetch(`https://serviceusage.googleapis.com/v1/projects/${projectId}/services/firebase.googleapis.com:enable`, {
@@ -160,7 +160,11 @@ async function provisionFirebase(userAuthClient) {
 app.get('/auth/google', (req, res) => {
     const authUrl = oauth2Client.generateAuthUrl({
         access_type: 'offline',
-        scope: ['https://www.googleapis.com/auth/cloud-platform', 'https://www.googleapis.com/auth/firebase'],
+        scope: [
+            'https://www.googleapis.com/auth/cloud-platform',
+            'https://www.googleapis.com/auth/firebase',
+            'https://www.googleapis.com/auth/service.management' // Added new scope
+        ],
         prompt: 'consent'
     });
     res.redirect(authUrl);

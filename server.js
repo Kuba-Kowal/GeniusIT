@@ -97,6 +97,14 @@ async function provisionFirebase(userAuthClient) {
     console.log('[Provisioning] Waiting 15 seconds for project to propagate...');
     await sleep(15000);
 
+    // --- NEW FIX: Explicitly enable the Firebase Management API ---
+    console.log('[Provisioning] Step 1.5: Enabling Firebase Management API...');
+    await authedFetch(`https://serviceusage.googleapis.com/v1/projects/${projectId}/services/firebase.googleapis.com:enable`, {
+        method: 'POST'
+    });
+    console.log('[Provisioning] Firebase Management API enabled.');
+    // --- END NEW FIX ---
+
     console.log('[Provisioning] Step 2: Adding Firebase to project...');
     await authedFetch(`https://firebase.googleapis.com/v1beta1/projects/${projectId}:addFirebase`, { method: 'POST' });
     console.log('[Provisioning] Firebase enabled for project.');

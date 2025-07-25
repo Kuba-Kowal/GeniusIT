@@ -40,6 +40,33 @@ const oauth2Client = new OAuth2Client(
     process.env.GOOGLE_OAUTH_REDIRECT_URI
 );
 
+// --- NEW POLLING HELPER FUNCTION ---
+const pollOperation = async (operation, userAuthClient) => {
+    let isDone = false;
+    let operationData;
+    console.log(`[Polling] -> Waiting for operation: ${operation.name}`);
+    
+    while (!isDone) {
+        await sleep(4000); // Wait 4 seconds between checks
+        
+        const response = await fetch(`https://firebase.googleapis.com/v1beta1/${operation.name}`, {
+            headers: { 'Authorization': `Bearer ${(await userAuthClient.getAccessToken()).token}` }
+        });
+        
+        const data = await response.json();
+
+        if (data.done) {
+            console.log(`[Polling] <- Operation ${operation.name} complete.`);
+            isDone = true;
+            operationData = data;
+        } else {
+            console.log(`[Polling] ... operation not done yet.`);
+        }
+    }
+    return operationData;
+};
+
+
 // --- FIREBASE PROVISIONING LOGIC (MODIFIED) ---
 async function provisionFirebase(userAuthClient) {
     const authedFetch = async (url, options = {}) => {
@@ -55,17 +82,14 @@ async function provisionFirebase(userAuthClient) {
             console.error('Google API Error:', JSON.stringify(errorBody, null, 2));
             throw new Error(`API call to ${url} failed with status ${response.status}: ${errorBody.error.message}`);
         }
-        const contentType = response.headers.get("content-type");
-        if (contentType && contentType.indexOf("application/json") !== -1) {
-            return response.json();
-        }
-        return response.text();
+        // Always expect JSON from these Google APIs
+        return response.json();
     };
 
     console.log('[Provisioning] Step 1: Creating Google Cloud project...');
     const projectDisplayName = 'My AI Chatbot Transcripts';
     const projectId = `ai-chatbot-${Date.now()}`;
-    await authedFetch('https://cloudresourcemanager.googleapis.com/v1/projects', {
+    await authedFetch(`https://cloudresourcemanager.googleapis.com/v1/projects`, {
         method: 'POST',
         body: JSON.stringify({ name: projectDisplayName, projectId }),
     });
@@ -79,39 +103,32 @@ async function provisionFirebase(userAuthClient) {
     console.log('[Provisioning] Firebase enabled for project.');
     
     console.log('[Provisioning] Step 2.1: Enabling Firestore API...');
-    await authedFetch(`https://serviceusage.googleapis.com/v1/projects/${projectId}/services/firestore.googleapis.com:enable`, {
-        method: 'POST'
-    });
+    await authedFetch(`https://serviceusage.googleapis.com/v1/projects/${projectId}/services/firestore.googleapis.com:enable`, { method: 'POST' });
     console.log('[Provisioning] Firestore API enabled.');
 
     console.log('[Provisioning] Waiting 10 seconds for API to be ready...');
     await sleep(10000); 
     
     console.log('[Provisioning] Step 2.5: Creating Firestore Database...');
-    await authedFetch(`https://firestore.googleapis.com/v1/projects/${projectId}/databases?databaseId=(default)`, {
+    const dbOperation = await authedFetch(`https://firestore.googleapis.com/v1/projects/${projectId}/databases?databaseId=(default)`, {
         method: 'POST',
-        body: JSON.stringify({
-            locationId: 'nam5', // Corrected from 'us-central' to 'nam5' (North America Multi-Region)
-            type: 'FIRESTORE_NATIVE'
-        })
+        body: JSON.stringify({ locationId: 'nam5', type: 'FIRESTORE_NATIVE' })
     });
-    console.log('[Provisioning] Firestore Database created.');
-
-    console.log('[Provisioning] Waiting 10 seconds for database to initialize...');
-    await sleep(10000);
+    await pollOperation(dbOperation, userAuthClient); // Wait for database creation to finish
+    console.log('[Provisioning] Firestore Database created and ready.');
     
     console.log('[Provisioning] Step 3: Creating Firebase Web App...');
-    const webAppDisplayName = 'AI Chatbot Widget';
-    const webApp = await authedFetch(`https://firebase.googleapis.com/v1beta1/projects/${projectId}/webApps`, {
+    const webAppOperation = await authedFetch(`https://firebase.googleapis.com/v1beta1/projects/${projectId}/webApps`, {
         method: 'POST',
-        body: JSON.stringify({ displayName: webAppDisplayName })
+        body: JSON.stringify({ displayName: 'AI Chatbot Widget' })
     });
+    const completedWebAppOperation = await pollOperation(webAppOperation, userAuthClient);
+    const webApp = completedWebAppOperation.response; // The actual app data is in the 'response' field
     console.log(`[Provisioning] Web App created with App ID: ${webApp.appId}`);
 
     console.log('[Provisioning] Step 4: Creating Service Account...');
     const saAccountId = `chatbot-server-${Date.now()}`.substring(0, 29);
     const saEmail = `${saAccountId}@${projectId}.iam.gserviceaccount.com`;
-    
     await authedFetch(`https://iam.googleapis.com/v1/projects/${projectId}/serviceAccounts`, {
         method: 'POST',
         body: JSON.stringify({ accountId: saAccountId, serviceAccount: { displayName: 'AI Chatbot Server' } })
@@ -125,7 +142,6 @@ async function provisionFirebase(userAuthClient) {
     const keyData = await authedFetch(`https://iam.googleapis.com/v1/projects/${projectId}/serviceAccounts/${saEmail}/keys`, {
         method: 'POST'
     });
-    
     const serviceAccountKey = JSON.parse(Buffer.from(keyData.privateKeyData, 'base64').toString('utf-8'));
     console.log('[Provisioning] Service Account key generated successfully.');
 
@@ -154,12 +170,10 @@ app.get('/auth/google/callback', async (req, res) => {
         const credentials = await provisionFirebase(oauth2Client);
         
         const apiKey = `bvr_${crypto.randomBytes(24).toString('hex')}`;
-        
         const serviceAccountJson = JSON.stringify(credentials.serviceAccount);
         const serviceAccountB64 = Buffer.from(serviceAccountJson).toString('base64');
         
         console.log(`[Provisioning] Customer setup complete. Redirecting to WordPress...`);
-
         const successUrl = `${process.env.WORDPRESS_ADMIN_URL}&provision_status=success&api_key=${apiKey}&service_account=${serviceAccountB64}`;
         res.redirect(successUrl);
 

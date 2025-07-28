@@ -41,7 +41,6 @@ const oauth2Client = new OAuth2Client(
 // --- FIREBASE PROVISIONING LOGIC (SIMPLIFIED) ---
 async function provisionProject(userAuthClient) {
     const authedFetch = async (url, options = {}) => {
-        // --- FIX: Corrected the typo from userAuthClien to userAuthClient ---
         const token = await userAuthClient.getAccessToken();
         const headers = {
             'Authorization': `Bearer ${token.token}`,
@@ -70,8 +69,9 @@ async function provisionProject(userAuthClient) {
     });
     console.log(`[Provisioning] Project creation initiated with ID: ${projectId}`);
     
-    console.log('[Provisioning] Waiting 30 seconds for project to propagate...');
-    await sleep(30000);
+    // --- FIX: Increased delay to 60 seconds for project propagation ---
+    console.log('[Provisioning] Waiting 60 seconds for project to propagate...');
+    await sleep(60000);
 
     const apisToEnable = [
         'firebase.googleapis.com',

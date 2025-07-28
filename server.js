@@ -43,7 +43,6 @@ const oauth2Client = new OAuth2Client(
 // --- FIREBASE PROVISIONING LOGIC (SEMI-AUTOMATED) ---
 async function provisionProject(userAuthClient) {
     const authedFetch = async (url, options = {}) => {
-        // THE FIX IS HERE: Changed userAuth to userAuthClient
         const token = await userAuthClient.getAccessToken();
         const headers = {
             'Authorization': `Bearer ${token.token}`,

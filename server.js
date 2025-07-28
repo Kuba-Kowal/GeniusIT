@@ -40,37 +40,10 @@ const oauth2Client = new OAuth2Client(
     process.env.GOOGLE_OAUTH_REDIRECT_URI
 );
 
-// --- UPDATED POLLING HELPER FUNCTION ---
-const pollOperation = async (operationName, apiBaseUrl, userAuthClient) => {
-    let isDone = false;
-    let operationData;
-    console.log(`[Polling] -> Waiting for operation: ${operationName}`);
-
-    while (!isDone) {
-        await sleep(4000); // Wait 4 seconds between checks
-
-        const response = await fetch(`${apiBaseUrl}/${operationName}`, {
-            headers: { 'Authorization': `Bearer ${(await userAuthClient.getAccessToken()).token}` }
-        });
-
-        const data = await response.json();
-
-        if (data.done) {
-            console.log(`[Polling] <- Operation ${operationName} complete.`);
-            isDone = true;
-            operationData = data;
-        } else {
-            console.log(`[Polling] ... operation not done yet.`);
-        }
-    }
-    return operationData;
-};
-
-
-// --- FIREBASE PROVISIONING LOGIC (MODIFIED) ---
+// --- FIREBASE PROVISIONING LOGIC (SEMI-AUTOMATED) ---
 async function provisionProject(userAuthClient) {
     const authedFetch = async (url, options = {}) => {
-        const token = await userAuthClient.getAccessToken();
+        const token = await userAuth.getAccessToken();
         const headers = {
             'Authorization': `Bearer ${token.token}`,
             'Content-Type': 'application/json',

@@ -1,6 +1,5 @@
 import express from 'express';
 import { WebSocketServer } from 'ws';
-import { OpenAI } from 'openai';
 import dotenv from 'dotenv';
 import { OAuth2Client } from 'google-auth-library';
 import crypto from 'crypto';
@@ -14,7 +13,6 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 // --- VARIABLE & CLIENT INITIALIZATION ---
 const REQUIRED_ENV = [
-    'OPENAI_API_KEY', 
     'ALLOWED_ORIGINS',
     'GOOGLE_OAUTH_CLIENT_ID',
     'GOOGLE_OAUTH_CLIENT_SECRET',
@@ -33,15 +31,15 @@ const app = express();
 app.use(express.json());
 const server = app.listen(process.env.PORT || 3000, () => console.log(`[HTTP] Server listening on port ${process.env.PORT || 3000}`));
 const wss = new WebSocketServer({ noServer: true });
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
 const oauth2Client = new OAuth2Client(
     process.env.GOOGLE_OAUTH_CLIENT_ID,
     process.env.GOOGLE_OAUTH_CLIENT_SECRET,
     process.env.GOOGLE_OAUTH_REDIRECT_URI
 );
 
-// --- FIREBASE PROVISIONING LOGIC (MODIFIED) ---
-async function provisionFirebase(userAuthClient) {
+// --- FIREBASE PROVISIONING LOGIC (SIMPLIFIED) ---
+async function provisionProject(userAuthClient) {
     const authedFetch = async (url, options = {}) => {
         const token = await userAuthClient.getAccessToken();
         const headers = {
@@ -53,7 +51,7 @@ async function provisionFirebase(userAuthClient) {
         if (!response.ok) {
             const errorBody = await response.json();
             console.error('Google API Error:', JSON.stringify(errorBody, null, 2));
-            throw new Error(`API call to ${url} failed with status ${response.status}: ${errorBody.error.message}`);
+            throw new Error(`API call to ${url} failed with status ${response.status}: ${errorBody.error?.message || 'Unknown error'}`);
         }
         const contentType = response.headers.get("content-type");
         if (contentType && contentType.indexOf("application/json") !== -1) {
@@ -63,7 +61,7 @@ async function provisionFirebase(userAuthClient) {
     };
 
     console.log('[Provisioning] Step 1: Creating Google Cloud project...');
-    const projectDisplayName = 'My AI Chatbot Transcripts';
+    const projectDisplayName = `AI Chatbot Project ${Date.now()}`;
     const projectId = `ai-chatbot-${Date.now()}`;
     await authedFetch('https://cloudresourcemanager.googleapis.com/v1/projects', {
         method: 'POST',
@@ -74,64 +72,32 @@ async function provisionFirebase(userAuthClient) {
     console.log('[Provisioning] Waiting 15 seconds for project to propagate...');
     await sleep(15000);
 
-    console.log('[Provisioning] Step 2: Adding Firebase to project...');
-    await authedFetch(`https://firebase.googleapis.com/v1beta1/projects/${projectId}:addFirebase`, { method: 'POST' });
-    console.log('[Provisioning] Firebase enabled for project.');
-    
-    // --- THE FIX: Create a Firestore database instance before creating a web app ---
-    console.log('[Provisioning] Step 2.5: Creating Firestore Database...');
-    await authedFetch(`https://firestore.googleapis.com/v1/projects/${projectId}/databases?databaseId=(default)`, {
-        method: 'POST',
-        body: JSON.stringify({
-            locationId: 'us-central', // You can change this to a region closer to you
-            type: 'FIRESTORE_NATIVE'
-        })
-    });
-    console.log('[Provisioning] Firestore Database created.');
-    // --- END FIX ---
+    const apisToEnable = [
+        'firebase.googleapis.com',
+        'firestore.googleapis.com',
+        'iam.googleapis.com'
+    ];
 
-    console.log('[Provisioning] Waiting 10 seconds for database to initialize...');
-    await sleep(10000);
+    console.log('[Provisioning] Step 2: Enabling necessary APIs...');
+    for (const api of apisToEnable) {
+        console.log(`[Provisioning] --> Enabling ${api}...`);
+        await authedFetch(`https://serviceusage.googleapis.com/v1/projects/${projectId}/services/${api}:enable`, {
+            method: 'POST'
+        });
+        console.log(`[Provisioning] <-- ${api} enabled.`);
+        await sleep(2000); // Small delay between API enablements
+    }
     
-    console.log('[Provisioning] Step 3: Creating Firebase Web App...');
-    const webAppDisplayName = 'AI Chatbot Widget';
-    const webApp = await authedFetch(`https://firebase.googleapis.com/v1beta1/projects/${projectId}/webApps`, {
-        method: 'POST',
-        body: JSON.stringify({ displayName: webAppDisplayName })
-    });
-    console.log(`[Provisioning] Web App created with App ID: ${webApp.appId}`);
+    console.log('[Provisioning] All necessary APIs enabled successfully.');
 
-    console.log('[Provisioning] Step 4: Creating Service Account...');
-    const saAccountId = `chatbot-server-${Date.now()}`.substring(0, 29);
-    const saEmail = `${saAccountId}@${projectId}.iam.gserviceaccount.com`;
-    
-    await authedFetch(`https://iam.googleapis.com/v1/projects/${projectId}/serviceAccounts`, {
-        method: 'POST',
-        body: JSON.stringify({ accountId: saAccountId, serviceAccount: { displayName: 'AI Chatbot Server' } })
-    });
-    console.log(`[Provisioning] Service Account created: ${saEmail}`);
-    
-    console.log('[Provisioning] Waiting 5 seconds for service account to be ready...');
-    await sleep(5000);
-    
-    console.log('[Provisioning] Step 5: Generating Service Account key...');
-    const keyData = await authedFetch(`https://iam.googleapis.com/v1/projects/${projectId}/serviceAccounts/${saEmail}/keys`, {
-        method: 'POST'
-    });
-    
-    const serviceAccountKey = JSON.parse(Buffer.from(keyData.privateKeyData, 'base64').toString('utf-8'));
-    console.log('[Provisioning] Service Account key generated successfully.');
-
-    return {
-        serviceAccount: serviceAccountKey
-    };
+    return { projectId };
 }
 
 // --- OAUTH & PROVISIONING ENDPOINTS ---
 app.get('/auth/google', (req, res) => {
     const authUrl = oauth2Client.generateAuthUrl({
         access_type: 'offline',
-        scope: ['https://www.googleapis.com/auth/cloud-platform', 'https://www.googleapis.com/auth/firebase'],
+        scope: ['https://www.googleapis.com/auth/cloud-platform'],
         prompt: 'consent'
     });
     res.redirect(authUrl);
@@ -139,29 +105,27 @@ app.get('/auth/google', (req, res) => {
 
 app.get('/auth/google/callback', async (req, res) => {
     const { code } = req.query;
+    let redirectUrl = `${process.env.WORDPRESS_ADMIN_URL}&page=bvr_config_page`;
+
     try {
         const { tokens } = await oauth2Client.getToken(code);
         oauth2Client.setCredentials(tokens);
 
-        console.log('[OAuth] User authenticated. Starting Firebase provisioning...');
-        const credentials = await provisionFirebase(userAuthClient);
+        console.log('[OAuth] User authenticated. Starting project provisioning...');
+        const { projectId } = await provisionProject(oauth2Client);
         
-        const apiKey = `bvr_${crypto.randomBytes(24).toString('hex')}`;
-        
-        const serviceAccountJson = JSON.stringify(credentials.serviceAccount);
-        const serviceAccountB64 = Buffer.from(serviceAccountJson).toString('base64');
-        
-        console.log(`[Provisioning] Customer setup complete. Redirecting to WordPress...`);
+        console.log(`[Provisioning] Project setup complete. Redirecting to WordPress...`);
 
-        const successUrl = `${process.env.WORDPRESS_ADMIN_URL}&provision_status=success&api_key=${apiKey}&service_account=${serviceAccountB64}`;
-        res.redirect(successUrl);
+        redirectUrl += `&provision_status=success&project_id=${projectId}`;
+        res.redirect(redirectUrl);
 
     } catch (error) {
         console.error('[OAuth Callback] An error occurred during provisioning:', error);
-        const errorUrl = `${process.env.WORDPRESS_ADMIN_URL}&provision_status=error&message=${encodeURIComponent(error.message)}`;
-        res.redirect(errorUrl);
+        redirectUrl += `&provision_status=error&message=${encodeURIComponent(error.message)}`;
+        res.redirect(redirectUrl);
     }
 });
+
 
 // --- WEBSOCKET UPGRADE & CONNECTION HANDLING ---
 server.on('upgrade', async (req, socket, head) => {
@@ -176,8 +140,9 @@ server.on('upgrade', async (req, socket, head) => {
     const queryObject = url.parse(req.url, true).query;
     const apiKey = queryObject.apiKey;
 
-    if (!apiKey) {
-        console.log('[AUTH] Connection rejected: Missing API Key.');
+    // This logic now happens inside WordPress, but we still need the key for the relay.
+    if (!apiKey || !apiKey.startsWith('bvr_')) {
+        console.log('[AUTH] Connection rejected: Missing or invalid API Key.');
         socket.destroy();
         return;
     }
@@ -189,7 +154,8 @@ server.on('upgrade', async (req, socket, head) => {
     });
 });
 
-// --- CHATBOT RELAY LOGIC ---
+// --- CHATBOT RELAY LOGIC (REMAINS THE SAME) ---
+// This part is unchanged as it correctly relays messages to WordPress
 const ipConnections = new Map();
 const MAX_CONNECTIONS_PER_IP = 10;
 
@@ -213,6 +179,7 @@ wss.on('connection', (ws, req) => {
     let sessionId = crypto.randomUUID();
 
     ws.on('message', async (message) => {
+        // This logic is simplified as we assume all messages are JSON from our client
         try {
             const relayUrl = `${ws.origin}/wp-json/bvr/v1/chat-relay`;
             const clientPayload = JSON.parse(message.toString());
@@ -240,12 +207,13 @@ wss.on('connection', (ws, req) => {
 
             const wordpressResponse = await response.json();
             
-            if (ws.readyState === 1) {
+            if (ws.readyState === 1) { // 1 === WebSocket.OPEN
                 ws.send(JSON.stringify(wordpressResponse));
             }
 
         } catch (error) {
             console.error('[WS] Error processing message:', error);
+            // This is likely a non-JSON message, we can ignore it
         }
     });
 

@@ -41,7 +41,7 @@ const oauth2Client = new OAuth2Client(
 // --- FIREBASE PROVISIONING LOGIC (SIMPLIFIED) ---
 async function provisionProject(userAuthClient) {
     const authedFetch = async (url, options = {}) => {
-        const token = await userAuthClient.getAccessToken();
+        const token = await userAuthClien.getAccessToken();
         const headers = {
             'Authorization': `Bearer ${token.token}`,
             'Content-Type': 'application/json',
@@ -61,7 +61,6 @@ async function provisionProject(userAuthClient) {
     };
 
     console.log('[Provisioning] Step 1: Creating Google Cloud project...');
-    // --- FIX: Shortened the display name to be under 30 characters ---
     const projectDisplayName = `AI Chat Project ${Date.now()}`;
     const projectId = `ai-chatbot-${Date.now()}`;
     await authedFetch('https://cloudresourcemanager.googleapis.com/v1/projects', {
@@ -70,8 +69,9 @@ async function provisionProject(userAuthClient) {
     });
     console.log(`[Provisioning] Project creation initiated with ID: ${projectId}`);
     
-    console.log('[Provisioning] Waiting 15 seconds for project to propagate...');
-    await sleep(15000);
+    // --- FIX: Increased delay to 30 seconds for project propagation ---
+    console.log('[Provisioning] Waiting 30 seconds for project to propagate...');
+    await sleep(30000);
 
     const apisToEnable = [
         'firebase.googleapis.com',
@@ -98,7 +98,11 @@ async function provisionProject(userAuthClient) {
 app.get('/auth/google', (req, res) => {
     const authUrl = oauth2Client.generateAuthUrl({
         access_type: 'offline',
-        scope: ['https://www.googleapis.com/auth/cloud-platform'],
+        // --- FIX: Added firebase scope for good measure ---
+        scope: [
+            'https://www.googleapis.com/auth/cloud-platform',
+            'https://www.googleapis.com/auth/firebase'
+        ],
         prompt: 'consent'
     });
     res.redirect(authUrl);
@@ -141,7 +145,6 @@ server.on('upgrade', async (req, socket, head) => {
     const queryObject = url.parse(req.url, true).query;
     const apiKey = queryObject.apiKey;
 
-    // This logic now happens inside WordPress, but we still need the key for the relay.
     if (!apiKey || !apiKey.startsWith('bvr_')) {
         console.log('[AUTH] Connection rejected: Missing or invalid API Key.');
         socket.destroy();
@@ -156,7 +159,6 @@ server.on('upgrade', async (req, socket, head) => {
 });
 
 // --- CHATBOT RELAY LOGIC (REMAINS THE SAME) ---
-// This part is unchanged as it correctly relays messages to WordPress
 const ipConnections = new Map();
 const MAX_CONNECTIONS_PER_IP = 10;
 
@@ -180,7 +182,6 @@ wss.on('connection', (ws, req) => {
     let sessionId = crypto.randomUUID();
 
     ws.on('message', async (message) => {
-        // This logic is simplified as we assume all messages are JSON from our client
         try {
             const relayUrl = `${ws.origin}/wp-json/bvr/v1/chat-relay`;
             const clientPayload = JSON.parse(message.toString());
@@ -214,7 +215,6 @@ wss.on('connection', (ws, req) => {
 
         } catch (error) {
             console.error('[WS] Error processing message:', error);
-            // This is likely a non-JSON message, we can ignore it
         }
     });
 

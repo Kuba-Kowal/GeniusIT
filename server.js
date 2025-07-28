@@ -61,7 +61,8 @@ async function provisionProject(userAuthClient) {
     };
 
     console.log('[Provisioning] Step 1: Creating Google Cloud project...');
-    const projectDisplayName = `AI Chatbot Project ${Date.now()}`;
+    // --- FIX: Shortened the display name to be under 30 characters ---
+    const projectDisplayName = `AI Chat Project ${Date.now()}`;
     const projectId = `ai-chatbot-${Date.now()}`;
     await authedFetch('https://cloudresourcemanager.googleapis.com/v1/projects', {
         method: 'POST',

@@ -106,13 +106,19 @@ app.get('/auth/google/callback', async (req, res) => {
         console.log('[OAuth] User authenticated. Starting project provisioning...');
         const { projectId } = await provisionProject(oauth2Client);
 
+        // --- FIX: Ensure redirect goes to the correct configuration page ---
+        const baseUrl = process.env.WORDPRESS_ADMIN_URL.split('?')[0];
+        const configPageUrl = `${baseUrl}?page=bvr_config_page`;
+
         console.log(`[Provisioning] Project created. Redirecting to WordPress for manual setup...`);
-        const successUrl = `${process.env.WORDPRESS_ADMIN_URL}&provision_status=manual_setup_required&project_id=${projectId}`;
+        const successUrl = `${configPageUrl}&provision_status=manual_setup_required&project_id=${projectId}`;
         res.redirect(successUrl);
 
     } catch (error) {
         console.error('[OAuth Callback] An error occurred during provisioning:', error);
-        const errorUrl = `${process.env.WORDPRESS_ADMIN_URL}&provision_status=error&message=${encodeURIComponent(error.message)}`;
+        const baseUrl = process.env.WORDPRESS_ADMIN_URL.split('?')[0];
+        const configPageUrl = `${baseUrl}?page=bvr_config_page`;
+        const errorUrl = `${configPageUrl}&provision_status=error&message=${encodeURIComponent(error.message)}`;
         res.redirect(errorUrl);
     }
 });

@@ -38,7 +38,7 @@ const oauth2Client = new OAuth2Client(
     process.env.GOOGLE_OAUTH_REDIRECT_URI
 );
 
-// --- FIREBASE PROVISIONING LOGIC (SIMPLIFIED) ---
+// --- FIREBASE PROVISIONING LOGIC ---
 async function provisionProject(userAuthClient) {
     const authedFetch = async (url, options = {}) => {
         const token = await userAuthClient.getAccessToken();
@@ -69,9 +69,8 @@ async function provisionProject(userAuthClient) {
     });
     console.log(`[Provisioning] Project creation initiated with ID: ${projectId}`);
     
-    // --- FIX: Increased delay to 60 seconds for project propagation ---
-    console.log('[Provisioning] Waiting 60 seconds for project to propagate...');
-    await sleep(60000);
+    console.log('[Provisioning] Waiting 30 seconds for project to propagate...');
+    await sleep(30000);
 
     const apisToEnable = [
         'firebase.googleapis.com',
@@ -86,10 +85,18 @@ async function provisionProject(userAuthClient) {
             method: 'POST'
         });
         console.log(`[Provisioning] <-- ${api} enabled.`);
-        await sleep(2000); // Small delay between API enablements
+        await sleep(2000);
     }
     
-    console.log('[Provisioning] All necessary APIs enabled successfully.');
+    // --- FIX: This crucial step links the GCP Project to Firebase ---
+    console.log('[Provisioning] Step 3: Adding Firebase to the project...');
+    await authedFetch(`https://firebase.googleapis.com/v1beta1/projects/${projectId}:addFirebase`, {
+        method: 'POST'
+    });
+    console.log('[Provisioning] Firebase has been added to the project.');
+    await sleep(5000); // Wait a moment for this change to apply
+    
+    console.log('[Provisioning] All necessary setup steps are complete.');
 
     return { projectId };
 }

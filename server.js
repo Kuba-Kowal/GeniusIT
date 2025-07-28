@@ -90,7 +90,7 @@ app.get('/auth/google', (req, res) => {
         scope: [
             'https://www.googleapis.com/auth/cloud-platform',
             'https://www.googleapis.com/auth/firebase',
-            'https://www.googleapis.com/auth/service.management' // This scope is required
+            'https://www.googleapis.com/auth/service.management'
         ],
         prompt: 'consent'
     });
@@ -98,6 +98,10 @@ app.get('/auth/google', (req, res) => {
 });
 
 app.get('/auth/google/callback', async (req, res) => {
+    // --- FIX: Ensure all redirects go to the correct configuration page ---
+    const baseAdminUrl = process.env.WORDPRESS_ADMIN_URL.split('?')[0];
+    const configPageUrl = `${baseAdminUrl}?page=bvr_config_page`;
+
     const { code } = req.query;
     try {
         const { tokens } = await oauth2Client.getToken(code);
@@ -106,18 +110,12 @@ app.get('/auth/google/callback', async (req, res) => {
         console.log('[OAuth] User authenticated. Starting project provisioning...');
         const { projectId } = await provisionProject(oauth2Client);
 
-        // --- FIX: Ensure redirect goes to the correct configuration page ---
-        const baseUrl = process.env.WORDPRESS_ADMIN_URL.split('?')[0];
-        const configPageUrl = `${baseUrl}?page=bvr_config_page`;
-
         console.log(`[Provisioning] Project created. Redirecting to WordPress for manual setup...`);
         const successUrl = `${configPageUrl}&provision_status=manual_setup_required&project_id=${projectId}`;
         res.redirect(successUrl);
 
     } catch (error) {
         console.error('[OAuth Callback] An error occurred during provisioning:', error);
-        const baseUrl = process.env.WORDPRESS_ADMIN_URL.split('?')[0];
-        const configPageUrl = `${baseUrl}?page=bvr_config_page`;
         const errorUrl = `${configPageUrl}&provision_status=error&message=${encodeURIComponent(error.message)}`;
         res.redirect(errorUrl);
     }

@@ -6,15 +6,26 @@ import { tmpdir } from 'os';
 import { OpenAI } from 'openai';
 import dotenv from 'dotenv';
 import admin from 'firebase-admin';
-import crypto from 'crypto';
-
 dotenv.config();
 
-// --- Environment Variable Validation ---
-if (!process.env.OPENAI_API_KEY || !process.env.ALLOWED_ORIGINS) {
-    console.error("FATAL ERROR: Missing required environment variables (OPENAI_API_KEY, ALLOWED_ORIGINS).");
+// Version 14.1
+
+if (!process.env.FIREBASE_CREDENTIALS || !process.env.OPENAI_API_KEY || !process.env.ALLOWED_ORIGINS) {
+    console.error("FATAL ERROR: Missing required environment variables (FIREBASE_CREDENTIALS, OPENAI_API_KEY, ALLOWED_ORIGINS).");
     process.exit(1);
 }
+
+try {
+    const serviceAccount = JSON.parse(process.env.FIREBASE_CREDENTIALS);
+    admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount)
+    });
+    console.log('[Firebase] Admin SDK initialized successfully.');
+} catch (error) {
+    console.error('[Firebase] Failed to initialize Admin SDK. Check your FIREBASE_CREDENTIALS environment variable.', error.message);
+    process.exit(1);
+}
+const db = admin.firestore();
 
 const app = express();
 app.use(express.json());
@@ -22,164 +33,79 @@ app.use(express.json());
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const wss = new WebSocketServer({ noServer: true });
 
-// --- Caching for Initialized Firebase Apps ---
-const firebaseAppsCache = new Map();
-
-// --- WebSocket Connection Handling ---
-wss.on('connection', (ws, req) => {
-    console.log('[WS] New client connecting...');
-
-    const ip = req.socket.remoteAddress;
-    let db;
-    let ttsVoice = 'nova';
-    let conversationHistory = [];
-    const origin = req.headers.origin;
-    const startTime = new Date();
-    
-    ws.once('message', async (initialMessage) => {
-        try {
-            const data = JSON.parse(initialMessage.toString());
-
-            if (data.type !== 'INIT_SESSION') {
-                console.log(`[AUTH] IP ${ip} sent invalid initial message type. Terminating.`);
-                return ws.terminate();
-            }
-
-            const { firebaseServiceAccount, config, pageContext, isProactive } = data.data;
-
-            if (!firebaseServiceAccount || !firebaseServiceAccount.project_id) {
-                console.log(`[AUTH] IP ${ip} missing valid service account in INIT_SESSION. Terminating.`);
-                return ws.terminate();
-            }
-            
-            const projectId = firebaseServiceAccount.project_id;
-
-            let tenantApp;
-            if (firebaseAppsCache.has(projectId)) {
-                tenantApp = firebaseAppsCache.get(projectId);
-            } else {
-                tenantApp = admin.initializeApp({
-                    credential: admin.credential.cert(firebaseServiceAccount),
-                }, projectId); // Use unique project ID as app name
-                firebaseAppsCache.set(projectId, tenantApp);
-            }
-            
-            db = tenantApp.firestore();
-            ttsVoice = config.tts_voice || 'nova';
-
-            console.log(`[AUTH] Session successfully initialized for tenant: ${projectId}`);
-
-            const basePrompt = generateSystemPrompt(config, pageContext);
-            conversationHistory = [{ role: 'system', content: basePrompt }];
-            
-            let initialMessageText = config.welcome_message || 'Hi there! How can I help you today? 👋';
-            if (isProactive) {
-                initialMessageText = config.proactive_message || 'Hello! Have any questions? I am here to help.';
-            }
-            
-            conversationHistory.push({ role: 'assistant', content: initialMessageText });
-            if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: initialMessageText }));
-            
-            ws.on('message', createMessageHandler(ws, db, conversationHistory, ttsVoice));
-
-        } catch (error) {
-            console.error(`[AUTH] Initialization failed for IP ${ip}:`, error.message);
-            return ws.terminate();
-        }
-    });
-
-    ws.on('close', async () => {
-        console.log(`[WS] Connection from IP ${ip} closed.`);
-        if (db && conversationHistory.length > 1) {
-             await logConversation(db, conversationHistory, origin, startTime);
-        }
-    });
-
-    ws.on('error', (err) => console.error('[WS] Connection error:', err));
-});
-
-function createMessageHandler(ws, db, conversationHistory, ttsVoice) {
-    let audioBufferArray = [];
-    let currentAudioBufferSize = 0;
-    let connectionMode = 'text';
-
-    return async (message) => {
-        try {
-            if (Buffer.isBuffer(message)) {
-                currentAudioBufferSize += message.length;
-                if (currentAudioBufferSize > 20 * 1024 * 1024) return ws.terminate();
-                audioBufferArray.push(message);
-                return;
-            }
-
-            const data = JSON.parse(message.toString());
-            let transcript = '';
-
-            switch (data.type) {
-                case 'TEXT_MESSAGE':
-                    transcript = data.text;
-                    break;
-                case 'INIT_VOICE':
-                    connectionMode = 'voice';
-                    return;
-                case 'END_VOICE':
-                    connectionMode = 'text';
-                    return;
-                case 'END_OF_STREAM':
-                    if (audioBufferArray.length > 0) {
-                        const completeAudioBuffer = Buffer.concat(audioBufferArray);
-                        audioBufferArray = [];
-                        currentAudioBufferSize = 0;
-                        transcript = await transcribeWhisper(completeAudioBuffer);
-                        if (transcript && transcript.trim() && ws.readyState === 1) {
-                            ws.send(JSON.stringify({ type: 'USER_TRANSCRIPT', text: transcript }));
-                        }
-                    }
-                    break;
-                default:
-                    return;
-            }
-
-            if (transcript && transcript.trim()) {
-                conversationHistory.push({ role: 'user', content: transcript });
-                const reply = await getAIReply(conversationHistory);
-                conversationHistory.push({ role: 'assistant', content: reply });
-
-                if (connectionMode === 'voice') {
-                    ws.send(JSON.stringify({ type: 'AI_RESPONSE_PENDING_AUDIO', text: reply }));
-                    await speakText(reply, ws, ttsVoice);
-                } else {
-                    ws.send(JSON.stringify({ type: 'AI_IS_TYPING' }));
-                    setTimeout(() => {
-                        if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: reply }));
-                    }, 750);
-                }
-            }
-
-        } catch (error) {
-            console.error('[Process] Error processing message:', error);
-        }
-    };
+async function logSupportQuery(name, contact, message, origin) {
+    if (!db) {
+        console.log('[Firestore] DB not init, skipping support query log.');
+        return;
+    }
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    const contact_type = emailRegex.test(contact) ? 'email' : 'phone';
+    try {
+        const queryData = {
+            name: name,
+            contact: contact,
+            contact_type: contact_type,
+            message: message || '',
+            origin: origin,
+            received_at: admin.firestore.FieldValue.serverTimestamp(),
+            status: 'open'
+        };
+        const docRef = await db.collection('support_queries').add(queryData);
+        console.log(`[Firestore] Logged new support query with ID: ${docRef.id}`);
+    } catch (error) {
+        console.error('[Firestore] Failed to log support query:', error.message);
+    }
 }
 
-function generateSystemPrompt(config, pageContext = {}) {
+function generateSystemPrompt(config, pageContext = {}, productData = []) {
     const safeConfig = (config && typeof config === 'object') ? config : {};
     const agentName = safeConfig.agent_name || 'Rohan';
     const companyName = safeConfig.company_name || 'the company';
+    
+    // UPDATED: Process structured product data
+    let productInfo = 'No specific product information provided.';
+    if (safeConfig.products && Array.isArray(safeConfig.products) && safeConfig.products.length > 0) {
+        productInfo = 'Here is the list of our products and services:\n' + safeConfig.products
+            .filter(p => p && p.name)
+            .map(p => `- Name: ${p.name}\n  Price: ${p.price || 'N/A'}\n  Description: ${p.description || 'No description available.'}`)
+            .join('\n\n');
+    }
+
+    let issuesAndSolutions = (safeConfig.faqs && Array.isArray(safeConfig.faqs) && safeConfig.faqs.length > 0)
+        ? 'Common Issues & Solutions:\n' + safeConfig.faqs.filter(faq => faq && faq.issue && faq.solution).map(faq => `Issue: ${faq.issue}\nSolution: ${faq.solution}`).join('\n\n')
+        : '';
     
     let contextPrompt = '';
     if (pageContext.url && pageContext.title) {
         contextPrompt = `The user is currently on the page titled "${pageContext.title}" (${pageContext.url}). Tailor your answers to be relevant to this page if possible.`;
     }
 
-    return `You are a friendly, professional, and empathetic customer support live chat agent for ${companyName}. Your name is ${agentName}. Your primary goal is to resolve customer issues efficiently.
-    IMPORTANT: Be concise. Keep your answers as short as possible while still being helpful. Use short, clear sentences. Use a conversational tone with contractions (I'm, you're, that's) and emojis where appropriate.
-    ${contextPrompt}`;
+    let woocommercePrompt = '';
+    if (productData.length > 0) {
+        const productList = productData.map(p => `- ${p.name} (Price: ${p.price}, URL: ${p.url}): ${p.description}`).join('\n');
+        woocommercePrompt = `You can also reference the following featured WooCommerce products if relevant:\n${productList}`;
+    }
+
+    return `You are a customer support live chat agent for ${companyName}. Your name is ${agentName}. You are friendly, professional, and empathetic. Your primary goal is to resolve customer issues efficiently.
+    IMPORTANT: Be concise. Keep your answers as short as possible while still being helpful. Use short, clear sentences. Use a conversational and friendly tone with contractions (I'm, you're, that's) and emojis where appropriate.
+    ${contextPrompt}
+    Your Core Responsibilities: Acknowledge and Empathize. Gather Information. Provide Solutions based on the company-specific information provided below.
+    
+    Company-Specific Information:
+    ${productInfo}
+    
+    ${issuesAndSolutions}
+    
+    ${woocommercePrompt}
+
+    Escalation Protocol: If you cannot resolve the issue, state that you will create a ticket for the technical team.`;
 }
 
 async function analyzeConversation(history) {
     const transcript = history.filter(msg => msg.role === 'user' || msg.role === 'assistant').map(msg => `${msg.role}: ${msg.content}`).join('\n');
-    if (!transcript) return { sentiment: 'N/A', subject: 'Empty Conversation', resolution_status: 'N/A', tags: [] };
+    if (!transcript) {
+        return { sentiment: 'N/A', subject: 'Empty Conversation', resolution_status: 'N/A', tags: [] };
+    }
     try {
         const analysisPrompt = `Analyze the following chat transcript. Return your answer as a single, valid JSON object with four keys: "sentiment" (Positive, Negative, or Neutral), "subject" (5 words or less), "resolution_status" (Resolved or Unresolved), and "tags" (an array of 1-3 relevant keywords, e.g., ["shipping", "refund"]). Transcript:\n${transcript}`;
         const response = await openai.chat.completions.create({
@@ -204,23 +130,31 @@ function slugify(text) {
     return text.toString().toLowerCase().trim().replace(/\s+/g, '-').replace(/[^\w\-]+/g, '').replace(/\-\-+/g, '-');
 }
 
-async function logConversation(db, history, origin, startTime) {
+async function logConversation(history, interactionType, origin, startTime) {
     if (!db || history.length <= 1) return;
     try {
         const { sentiment, subject, resolution_status, tags } = await analyzeConversation(history);
-        const fullTranscript = history.filter(msg => msg.role !== 'system').map(msg => `[${msg.role}] ${msg.content}`).join('\n---\n');
+        const fullTranscript = history.filter(msg => msg.role !== 'system').map(msg => {
+            return msg.role === 'metadata' ? `[SYSTEM] ${msg.content}` : `[${msg.role}] ${msg.content}`;
+        }).join('\n---\n');
         
-        if (!fullTranscript) return;
+        if (!fullTranscript) {
+            console.log('[Firestore] No user/assistant messages to log. Skipping.');
+            return;
+        }
 
-        const docId = `${startTime.toISOString()}-${slugify(subject)}`;
+        const date = new Date(startTime);
+        const timestamp = `${date.getFullYear()}${(date.getMonth()+1).toString().padStart(2, '0')}${date.getDate().toString().padStart(2, '0')}-${date.getHours().toString().padStart(2, '0')}${date.getMinutes().toString().padStart(2, '0')}`;
+        const docId = `${timestamp}-${slugify(subject)}`;
 
         await db.collection('conversations').doc(docId).set({
+            interaction_type: interactionType,
             origin: origin || 'unknown',
             start_time: startTime,
             end_time: admin.firestore.FieldValue.serverTimestamp(),
             sentiment, subject, transcript: fullTranscript, resolution_status, tags
         });
-        console.log(`[Firestore] Logged conversation: "${docId}"`);
+        console.log(`[Firestore] Logged conversation with ID: "${docId}"`);
     } catch (error) {
         console.error('[Firestore] Failed to log conversation:', error.message);
     }
@@ -251,18 +185,151 @@ async function speakText(text, ws, voice = 'nova') {
     try {
         const mp3 = await openai.audio.speech.create({ model: "tts-1", voice, input: text, speed: 1.13 });
         const buffer = Buffer.from(await mp3.arrayBuffer());
-        if (ws.readyState === 1) ws.send(buffer);
+        if (ws.readyState === 1) {
+            ws.send(buffer);
+        }
     } catch (error) {
         console.error('[OpenAI TTS] Synthesis error:', error);
     }
 }
+
+const ipConnections = new Map();
+const MAX_CONNECTIONS_PER_IP = 3;
+const MAX_AUDIO_BUFFER_SIZE_MB = 20;
+
+wss.on('connection', (ws, req) => {
+    const ip = req.socket.remoteAddress;
+    const currentConnections = ipConnections.get(ip) || 0;
+    if (currentConnections >= MAX_CONNECTIONS_PER_IP) {
+        console.log(`[AUTH] IP ${ip} exceeded max connection limit. Connection rejected.`);
+        ws.terminate();
+        return;
+    }
+    ipConnections.set(ip, currentConnections + 1);
+    console.log(`[WS] Connection from ${ip} accepted.`);
+
+    let conversationHistory = [];
+    let connectionMode = 'text';
+    let ttsVoice = 'nova';
+    const origin = req.headers.origin;
+    const startTime = new Date();
+    let audioBufferArray = [];
+    let currentAudioBufferSize = 0;
+
+    ws.on('message', async (message) => {
+        let isCommand = false;
+        try {
+            if (Buffer.isBuffer(message)) {
+                currentAudioBufferSize += message.length;
+                if (currentAudioBufferSize > MAX_AUDIO_BUFFER_SIZE_MB * 1024 * 1024) {
+                    ws.terminate();
+                    return;
+                }
+            }
+            const data = JSON.parse(message.toString());
+            isCommand = true;
+            
+            if (data.type === 'CONFIG') {
+                const configData = (data.data && data.data.config) ? data.data.config : {};
+                const isProactive = (data.data && data.data.isProactive) ? data.data.isProactive : false;
+                const pageContext = (data.data && data.data.pageContext) ? data.data.pageContext : {};
+                const productData = (data.data && data.data.productData) ? data.data.productData : [];
+
+                const agentName = configData.agent_name || 'AI Agent';
+                ttsVoice = configData.tts_voice || 'nova';
+                const basePrompt = generateSystemPrompt(configData, pageContext, productData);
+                conversationHistory = [{ role: 'system', content: basePrompt }];
+                
+                let initialMessage = configData.welcome_message || `Hi there! My name is ${agentName}. How can I help you today? 👋`;
+                if (isProactive) {
+                    initialMessage = configData.proactive_message || 'Hello! Have any questions? I am here to help.';
+                }
+                
+                conversationHistory.push({ role: 'assistant', content: initialMessage });
+
+                if (ws.readyState === 1) {
+                    ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: initialMessage }));
+                }
+                console.log(`[WS] Session initialized for Agent: ${agentName}. Proactive: ${isProactive}`);
+                return;
+            }
+
+            if (conversationHistory.length === 0) {
+                console.log('[WS] Ignoring message: Session not yet initialized with CONFIG.');
+                return;
+            }
+
+            if (data.type === 'SUBMIT_LEAD_FORM') {
+                const { name, contact, message } = data.payload;
+                await logSupportQuery(name, contact, message, origin);
+                const leadInfoForTranscript = `Support query submitted. Name: ${name}, Contact: ${contact}, Message: ${message || 'N/A'}`;
+                conversationHistory.push({ role: 'metadata', content: leadInfoForTranscript });
+                const confirmationMessage = `Thank you, ${name}! Your request has been received. An agent will be in touch at ${contact} as soon as possible.`;
+                conversationHistory.push({ role: 'assistant', content: confirmationMessage });
+                if (ws.readyState === 1) {
+                    ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: confirmationMessage }));
+                }
+                return;
+            }
+
+            let transcript = '';
+            if (data.type === 'SET_LANGUAGE') { return; }
+            if (data.type === 'INIT_VOICE') { connectionMode = 'voice'; return; }
+            if (data.type === 'END_VOICE') { connectionMode = 'text'; return; }
+            if (data.type === 'TEXT_MESSAGE') {
+                transcript = data.text;
+            } else if (data.type === 'END_OF_STREAM') {
+                if (audioBufferArray.length === 0) return;
+                const completeAudioBuffer = Buffer.concat(audioBufferArray);
+                audioBufferArray = [];
+                currentAudioBufferSize = 0;
+                transcript = await transcribeWhisper(completeAudioBuffer);
+                if (transcript && transcript.trim() && ws.readyState === 1) {
+                    ws.send(JSON.stringify({ type: 'USER_TRANSCRIPT', text: transcript }));
+                }
+            }
+
+            if (transcript && transcript.trim()) {
+                conversationHistory.push({ role: 'user', content: transcript });
+                const reply = await getAIReply(conversationHistory);
+                conversationHistory.push({ role: 'assistant', content: reply });
+
+                if (connectionMode === 'voice') {
+                    ws.send(JSON.stringify({ type: 'AI_RESPONSE_PENDING_AUDIO', text: reply }));
+                    await speakText(reply, ws, ttsVoice);
+                } else {
+                    ws.send(JSON.stringify({ type: 'AI_IS_TYPING' }));
+                    setTimeout(() => {
+                        if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: reply }));
+                    }, 750);
+                }
+            }
+        } catch (error) {
+            if (!isCommand && Buffer.isBuffer(message)) {
+                audioBufferArray.push(message);
+            } else {
+                console.error('[Process] Error processing command:', error);
+            }
+        }
+    });
+
+    ws.on('close', async () => {
+        console.log(`[WS] Connection from IP ${ip} closed.`);
+        const connections = (ipConnections.get(ip) || 1) - 1;
+        if (connections === 0) ipConnections.delete(ip);
+        else ipConnections.set(ip, connections);
+        await logConversation(conversationHistory, connectionMode, origin, startTime);
+    });
+
+    ws.on('error', (err) => console.error('[WS] Connection error:', err));
+});
 
 const server = app.listen(process.env.PORT || 3000, () => console.log(`[HTTP] Server listening on port ${process.env.PORT || 3000}`));
 
 server.on('upgrade', (req, socket, head) => {
     const origin = req.headers.origin;
     const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',');
-    if (allowedOrigins.includes(origin) || process.env.NODE_ENV === 'development') {
+    if (allowedOrigins.includes(origin)) {
         wss.handleUpgrade(req, socket, head, (ws) => {
             wss.emit('connection', ws, req);
         });

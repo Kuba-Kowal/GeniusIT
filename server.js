@@ -98,20 +98,49 @@ function generateSystemPrompt(config, pageContext = {}, productData = []) {
     let contextPrompt = pageContext.url && pageContext.title ? `The user is currently on the page titled "${pageContext.title}" (${pageContext.url}). Tailor your answers to be relevant to this page if possible.` : '';
     let woocommercePrompt = '';
     if (productData.length > 0) {
-        const productList = productData.map(p => `- ${p.name} (Price: ${p.price}, URL: ${p.url}): ${p.description}`).join('\n');
+        const productList = productData.map(p => `- Name: ${p.name} (Price: ${p.price}, URL: ${p.url}): ${p.description}`).join('\n');
         woocommercePrompt = `You can also reference the following featured WooCommerce products if relevant:\n${productList}`;
     }
-    return `You are a customer support live chat agent for ${companyName}. Your name is ${agentName}. You are friendly, professional, and empathetic. Your primary goal is to resolve customer issues efficiently. IMPORTANT: Be concise. Keep your answers as short as possible while still being helpful. Use short, clear sentences. Use a conversational and friendly tone with contractions (I'm, you're, that's) and emojis where appropriate. ${contextPrompt} Your Core Responsibilities: Acknowledge and Empathize. Gather Information. Provide Solutions based on the company-specific information provided below. Company-Specific Information: ${productInfo} ${issuesAndSolutions} ${woocommercePrompt} Escalation Protocol: If you cannot resolve the issue, state that you will create a ticket for the technical team.`;
+    return `You are a customer support live chat agent for ${companyName}. Your name is ${agentName}. You are friendly, professional, and empathetic. Your primary goal is to resolve customer issues efficiently. IMPORTANT: Be concise. Keep your answers as short as possible while still being helpful. Use short, clear sentences. Use a conversational and friendly tone with contractions (I'm, you're, that's) and emojis where appropriate. ${contextPrompt} Your Core Responsibilities: Acknowledge and Empathize. Gather Information. Provide Solutions based on the company-specific information provided below. Company-Specific Information: ${productInfo} ${issuesAndSolutions} ${woocommercePrompt} Escalation Protocol: If you cannot resolve the issue, state that you will create a ticket for the technical team. After providing a solution, ask the user "Has this resolved your issue?".`;
 }
 
-async function analyzeConversation(history) {
+async function analyzeConversation(history, userConfirmation = null) {
     const transcript = history.filter(msg => msg.role === 'user' || msg.role === 'assistant').map(msg => `${msg.role}: ${msg.content}`).join('\n');
-    if (!transcript) return { sentiment: 'N/A', subject: 'Empty Conversation', resolution_status: 'N/A', tags: [] };
+    if (!transcript) {
+        return { sentiment: 'N/A', subject: 'Empty Conversation', resolution_status: 'N/A', tags: [], intent: 'N/A' };
+    }
+
     try {
-        const response = await openai.chat.completions.create({ model: 'gpt-4o-mini', messages: [{ role: 'system', content: `Analyze the following chat transcript. Return a single, valid JSON object with four keys: "sentiment" (Positive, Negative, or Neutral), "subject" (5 words or less), "resolution_status" (Resolved or Unresolved), and "tags" (an array of 1-3 relevant keywords). Transcript:\n${transcript}` }], response_format: { type: "json_object" } });
-        const analysis = JSON.parse(response.choices[0].message.content);
-        return { sentiment: analysis.sentiment || 'Unknown', subject: analysis.subject || 'No Subject', resolution_status: analysis.resolution_status || 'Unknown', tags: analysis.tags || [] };
-    } catch (error) { console.error('[AI Analysis] Failed to analyze conversation:', error); return { sentiment: 'Error', subject: 'Analysis Failed', resolution_status: 'Error', tags: [] }; }
+        const analysisPrompt = `Analyze the following chat transcript. Return a single, valid JSON object with five keys: "sentiment" (Positive, Negative, or Neutral), "subject" (5 words or less), "intent" ("Question/Issue", "General Chat/Greeting", or "Feedback"), "resolution_status" ("Resolved", "Unresolved", or if the intent is "General Chat/Greeting", this MUST be "N/A"), and "tags" (an array of 1-3 relevant keywords). Transcript:\n${transcript}`;
+        
+        const response = await openai.chat.completions.create({
+            model: 'gpt-4o-mini',
+            messages: [{ role: 'system', content: analysisPrompt }],
+            response_format: { type: "json_object" }
+        });
+
+        let analysis = JSON.parse(response.choices[0].message.content);
+
+        // Override AI analysis if the user has explicitly confirmed resolution.
+        if (userConfirmation === "Resolved") {
+            analysis.resolution_status = "Resolved";
+            // If the user confirms resolution, we can infer the intent was a question.
+            if (analysis.intent === "General Chat/Greeting") {
+                analysis.intent = "Question/Issue";
+            }
+        }
+        
+        return {
+            sentiment: analysis.sentiment || 'Unknown',
+            subject: analysis.subject || 'No Subject',
+            intent: analysis.intent || 'Unknown',
+            resolution_status: analysis.resolution_status || 'Unknown',
+            tags: analysis.tags || []
+        };
+    } catch (error) {
+        console.error('[AI Analysis] Failed to analyze conversation:', error);
+        return { sentiment: 'Error', subject: 'Analysis Failed', resolution_status: 'Error', tags: [], intent: 'Error' };
+    }
 }
 
 function slugify(text) {
@@ -119,10 +148,10 @@ function slugify(text) {
     return text.toString().toLowerCase().trim().replace(/\s+/g, '-').replace(/[^\w\-]+/g, '').replace(/\-\-+/g, '-');
 }
 
-async function logConversation(db, history, interactionType, origin, startTime) {
+async function logConversation(db, history, interactionType, origin, startTime, userConfirmation = null) {
     if (!db || history.length <= 1) return;
     try {
-        const { sentiment, subject, resolution_status, tags } = await analyzeConversation(history);
+        const { sentiment, subject, resolution_status, tags, intent } = await analyzeConversation(history, userConfirmation);
         const fullTranscript = history.filter(msg => msg.role !== 'system').map(msg => msg.role === 'metadata' ? `[SYSTEM] ${msg.content}` : `[${msg.role}] ${msg.content}`).join('\n---\n');
         if (!fullTranscript) return;
         const date = new Date(startTime);
@@ -137,9 +166,10 @@ async function logConversation(db, history, interactionType, origin, startTime) 
             subject,
             transcript: fullTranscript,
             resolution_status,
+            intent, // Save the new intent field
             tags
         });
-        console.log(`[Firestore] Logged conversation with ID: "${docId}"`);
+        console.log(`[Firestore] Logged conversation with ID: "${docId}", Intent: ${intent}, Status: ${resolution_status}`);
     } catch (error) { console.error('[Firestore] Failed to log conversation:', error.message); }
 }
 
@@ -174,6 +204,7 @@ wss.on('connection', (ws, req, tenantId) => {
     console.log(`[WS] Connection for tenant ${tenantId} accepted.`);
     let conversationHistory = [], connectionMode = 'text', ttsVoice = 'nova', audioBufferArray = [], currentAudioBufferSize = 0;
     const origin = req.headers.origin, startTime = new Date(), MAX_AUDIO_BUFFER_SIZE_MB = 20;
+    let conversationLogged = false;
 
     ws.on('message', async (message) => {
         try {
@@ -188,6 +219,16 @@ wss.on('connection', (ws, req, tenantId) => {
                 return;
             }
             if (conversationHistory.length === 0) return;
+            
+            if (data.type === 'ISSUE_RESOLVED_CONFIRMATION') {
+                console.log(`[WS] User confirmed resolution for tenant ${tenantId}.`);
+                await logConversation(db, conversationHistory, connectionMode, origin, startTime, "Resolved");
+                conversationLogged = true;
+                if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: "Great! Thanks for confirming. Have a nice day!" }));
+                setTimeout(() => ws.close(), 2000);
+                return;
+            }
+
             if (data.type === 'SUBMIT_LEAD_FORM') {
                 const { name, contact, message: msg } = data.payload;
                 await logSupportQuery(db, name, contact, msg, origin);
@@ -212,12 +253,16 @@ wss.on('connection', (ws, req, tenantId) => {
                 conversationHistory.push({ role: 'user', content: transcript });
                 const reply = await getAIReply(conversationHistory);
                 conversationHistory.push({ role: 'assistant', content: reply });
+                
+                const resolutionQuestion = "has this resolved your issue";
+                const showConfirmationButtons = reply.toLowerCase().includes(resolutionQuestion.toLowerCase());
+
                 if (connectionMode === 'voice') {
-                    ws.send(JSON.stringify({ type: 'AI_RESPONSE_PENDING_AUDIO', text: reply }));
+                    ws.send(JSON.stringify({ type: 'AI_RESPONSE_PENDING_AUDIO', text: reply, showConfirmation: showConfirmationButtons }));
                     await speakText(reply, ws, ttsVoice);
                 } else {
                     ws.send(JSON.stringify({ type: 'AI_IS_TYPING' }));
-                    setTimeout(() => { if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: reply })); }, 750);
+                    setTimeout(() => { if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: reply, showConfirmation: showConfirmationButtons })); }, 750);
                 }
             }
         } catch (e) {
@@ -232,13 +277,14 @@ wss.on('connection', (ws, req, tenantId) => {
     });
     ws.on('close', async () => {
         console.log(`[WS] Connection for tenant ${tenantId} closed.`);
-        await logConversation(db, conversationHistory, connectionMode, origin, startTime);
+        if (!conversationLogged) {
+            await logConversation(db, conversationHistory, connectionMode, origin, startTime);
+        }
     });
     ws.on('error', (err) => console.error(`[WS Tenant ${tenantId}] Connection error:`, err));
 });
 
 const server = app.listen(process.env.PORT || 3000, () => { console.log(`[HTTP] Server listening on port ${process.env.PORT || 3000}`); });
-
 server.on('upgrade', (req, socket, head) => {
     const { query } = url.parse(req.url, true);
     const token = query.token;

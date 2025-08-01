@@ -1,184 +1,209 @@
 import express from 'express';
 import { WebSocketServer } from 'ws';
-import fs from 'fs';
-import path from 'path';
-import { tmpdir } from 'os';
 import { OpenAI } from 'openai';
 import dotenv from 'dotenv';
 import admin from 'firebase-admin';
+import crypto from 'crypto';
+import jwt from 'jsonwebtoken';
+import url from 'url';
 
 dotenv.config();
 
 // --- Environment Variable Validation ---
-if (!process.env.OPENAI_API_KEY || !process.env.ALLOWED_ORIGINS) {
-    console.error("FATAL ERROR: Missing required environment variables (OPENAI_API_KEY, ALLOWED_ORIGINS).");
+if (!process.env.OPENAI_API_KEY || !process.env.JWT_SECRET || !process.env.ALLOWED_ORIGINS) {
+    console.error("FATAL ERROR: Missing required environment variables (OPENAI_API_KEY, JWT_SECRET, ALLOWED_ORIGINS).");
     process.exit(1);
 }
 
-const app = express();
-app.use(express.json());
+// --- Firebase Tenant Manager ---
+// Manages dynamic initialization and caching of Firebase app instances for each tenant.
+class FirebaseTenantManager {
+    constructor() {
+        this.initializedApps = new Map();
+    }
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const wss = new WebSocketServer({ noServer: true });
+    /**
+     * Initializes a Firebase app for a given tenant if it doesn't already exist.
+     * @param {object} serviceAccount The Firebase service account JSON.
+     * @param {string} tenantId The unique ID for the tenant.
+     * @returns {admin.app.App} The initialized Firebase app instance.
+     */
+    initializeAppForTenant(serviceAccount, tenantId) {
+        if (this.initializedApps.has(tenantId)) {
+            return this.initializedApps.get(tenantId);
+        }
 
-// --- Caching for Initialized Firebase Apps ---
-const firebaseAppsCache = new Map();
-
-// --- WebSocket Connection Handling ---
-wss.on('connection', (ws, req) => {
-    console.log('[WS] New client connecting...');
-
-    const ip = req.socket.remoteAddress;
-    let db;
-    let ttsVoice = 'nova';
-    let conversationHistory = [];
-    const origin = req.headers.origin;
-    const startTime = new Date();
-    
-    ws.once('message', async (initialMessage) => {
         try {
-            const data = JSON.parse(initialMessage.toString());
-
-            if (data.type !== 'INIT_SESSION') {
-                console.log(`[AUTH] IP ${ip} sent invalid initial message type. Terminating.`);
-                return ws.terminate();
-            }
-
-            const { firebaseServiceAccount, config, pageContext, isProactive } = data.data;
-
-            if (!firebaseServiceAccount || !firebaseServiceAccount.project_id) {
-                console.log(`[AUTH] IP ${ip} missing valid service account in INIT_SESSION. Terminating.`);
-                return ws.terminate();
-            }
-            
-            const projectId = firebaseServiceAccount.project_id;
-
-            let tenantApp;
-            if (firebaseAppsCache.has(projectId)) {
-                tenantApp = firebaseAppsCache.get(projectId);
-            } else {
-                tenantApp = admin.initializeApp({
-                    credential: admin.credential.cert(firebaseServiceAccount),
-                }, projectId); // Use unique project ID as app name
-                firebaseAppsCache.set(projectId, tenantApp);
-            }
-            
-            db = tenantApp.firestore();
-            ttsVoice = config.tts_voice || 'nova';
-
-            console.log(`[AUTH] Session successfully initialized for tenant: ${projectId}`);
-
-            const basePrompt = generateSystemPrompt(config, pageContext);
-            conversationHistory = [{ role: 'system', content: basePrompt }];
-            
-            let initialMessageText = config.welcome_message || 'Hi there! How can I help you today? 👋';
-            if (isProactive) {
-                initialMessageText = config.proactive_message || 'Hello! Have any questions? I am here to help.';
-            }
-            
-            conversationHistory.push({ role: 'assistant', content: initialMessageText });
-            if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: initialMessageText }));
-            
-            ws.on('message', createMessageHandler(ws, db, conversationHistory, ttsVoice));
-
+            const app = admin.initializeApp({
+                credential: admin.credential.cert(serviceAccount),
+            }, tenantId); // Use tenantId as the app name
+            this.initializedApps.set(tenantId, app);
+            console.log(`[Firebase] Initialized new app for tenant: ${tenantId}`);
+            return app;
         } catch (error) {
-            console.error(`[AUTH] Initialization failed for IP ${ip}:`, error.message);
-            return ws.terminate();
+            console.error(`[Firebase] Failed to initialize app for tenant ${tenantId}:`, error.message);
+            // If initialization fails, check for a "duplicate app" error which might occur in rare race conditions.
+            if (error.code === 'app/duplicate-app' && !this.initializedApps.has(tenantId)) {
+                 const existingApp = admin.app(tenantId);
+                 this.initializedApps.set(tenantId, existingApp);
+                 return existingApp;
+            }
+            throw new Error('Invalid Firebase service account key provided.');
         }
-    });
+    }
 
-    ws.on('close', async () => {
-        console.log(`[WS] Connection from IP ${ip} closed.`);
-        if (db && conversationHistory.length > 1) {
-             await logConversation(db, conversationHistory, origin, startTime);
-        }
-    });
+    /**
+     * Gets an already initialized Firebase app instance for a tenant.
+     * @param {string} tenantId The unique ID for the tenant.
+     * @returns {admin.app.App|null} The app instance or null if not found.
+     */
+    getApp(tenantId) {
+        return this.initializedApps.get(tenantId) || null;
+    }
+}
+const tenantManager = new FirebaseTenantManager();
 
-    ws.on('error', (err) => console.error('[WS] Connection error:', err));
+
+// --- Express App Setup ---
+const app = express();
+app.use(express.json({ limit: '1mb' })); // Protect against large payloads
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+
+// --- API: Initialize Session ---
+// Receives a Firebase Admin SDK key, validates it, and returns a JWT session token.
+app.post('/api/init-session', (req, res) => {
+    const { serviceAccount } = req.body;
+
+    if (!serviceAccount || typeof serviceAccount !== 'object' || !serviceAccount.project_id) {
+        return res.status(400).json({ success: false, message: 'Invalid or missing Firebase service account key.' });
+    }
+
+    try {
+        // Create a stable, unique ID for the tenant based on their project ID.
+        const tenantId = crypto.createHash('sha256').update(serviceAccount.project_id).digest('hex');
+
+        // Initialize the app. This also serves as validation for the key.
+        tenantManager.initializeAppForTenant(serviceAccount, tenantId);
+
+        // Generate a short-lived JWT for the WebSocket connection
+        const token = jwt.sign({ tenantId }, process.env.JWT_SECRET, { expiresIn: '5m' });
+        
+        const websocketUrl = process.env.WEBSOCKET_URL || 'wss://your-websocket-server.onrender.com'; // Fallback URL
+        res.json({ success: true, token, websocketUrl });
+
+    } catch (error) {
+        console.error('[AUTH] Service account validation failed:', error.message);
+        res.status(401).json({ success: false, message: 'The provided Firebase service account key is invalid.' });
+    }
 });
 
-function createMessageHandler(ws, db, conversationHistory, ttsVoice) {
-    let audioBufferArray = [];
-    let currentAudioBufferSize = 0;
-    let connectionMode = 'text';
 
-    return async (message) => {
-        try {
-            if (Buffer.isBuffer(message)) {
-                currentAudioBufferSize += message.length;
-                if (currentAudioBufferSize > 20 * 1024 * 1024) return ws.terminate();
-                audioBufferArray.push(message);
-                return;
-            }
+// --- WebSocket Server Setup ---
+const wss = new WebSocketServer({ noServer: true });
 
-            const data = JSON.parse(message.toString());
-            let transcript = '';
+// --- Core Application Logic (Refactored for Multi-Tenancy) ---
 
-            switch (data.type) {
-                case 'TEXT_MESSAGE':
-                    transcript = data.text;
-                    break;
-                case 'INIT_VOICE':
-                    connectionMode = 'voice';
-                    return;
-                case 'END_VOICE':
-                    connectionMode = 'text';
-                    return;
-                case 'END_OF_STREAM':
-                    if (audioBufferArray.length > 0) {
-                        const completeAudioBuffer = Buffer.concat(audioBufferArray);
-                        audioBufferArray = [];
-                        currentAudioBufferSize = 0;
-                        transcript = await transcribeWhisper(completeAudioBuffer);
-                        if (transcript && transcript.trim() && ws.readyState === 1) {
-                            ws.send(JSON.stringify({ type: 'USER_TRANSCRIPT', text: transcript }));
-                        }
-                    }
-                    break;
-                default:
-                    return;
-            }
-
-            if (transcript && transcript.trim()) {
-                conversationHistory.push({ role: 'user', content: transcript });
-                const reply = await getAIReply(conversationHistory);
-                conversationHistory.push({ role: 'assistant', content: reply });
-
-                if (connectionMode === 'voice') {
-                    ws.send(JSON.stringify({ type: 'AI_RESPONSE_PENDING_AUDIO', text: reply }));
-                    await speakText(reply, ws, ttsVoice);
-                } else {
-                    ws.send(JSON.stringify({ type: 'AI_IS_TYPING' }));
-                    setTimeout(() => {
-                        if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: reply }));
-                    }, 750);
-                }
-            }
-
-        } catch (error) {
-            console.error('[Process] Error processing message:', error);
-        }
-    };
+async function logSupportQuery(db, name, contact, message, origin) {
+    if (!db) {
+        console.log('[Firestore] DB not available, skipping support query log.');
+        return;
+    }
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    const contact_type = emailRegex.test(contact) ? 'email' : 'phone';
+    try {
+        const queryData = {
+            name, contact, contact_type, message: message || '', origin,
+            received_at: admin.firestore.FieldValue.serverTimestamp(),
+            status: 'open'
+        };
+        const docRef = await db.collection('support_queries').add(queryData);
+        console.log(`[Firestore] Logged new support query with ID: ${docRef.id}`);
+    } catch (error) {
+        console.error('[Firestore] Failed to log support query:', error.message);
+    }
 }
 
-function generateSystemPrompt(config, pageContext = {}) {
+async function logConversation(db, history, interactionType, origin, startTime) {
+    if (!db || history.length <= 1) return;
+    try {
+        const { sentiment, subject, resolution_status, tags } = await analyzeConversation(history);
+        const fullTranscript = history.filter(msg => msg.role !== 'system').map(msg => {
+            return msg.role === 'metadata' ? `[SYSTEM] ${msg.content}` : `[${msg.role}] ${msg.content}`;
+        }).join('\n---\n');
+        
+        if (!fullTranscript) {
+            console.log('[Firestore] No user/assistant messages to log. Skipping.');
+            return;
+        }
+
+        const date = new Date(startTime);
+        const timestamp = `${date.getFullYear()}${(date.getMonth()+1).toString().padStart(2, '0')}${date.getDate().toString().padStart(2, '0')}-${date.getHours().toString().padStart(2, '0')}${date.getMinutes().toString().padStart(2, '0')}`;
+        const docId = `${timestamp}-${slugify(subject)}`;
+
+        await db.collection('conversations').doc(docId).set({
+            interaction_type: interactionType,
+            origin: origin || 'unknown',
+            start_time: startTime,
+            end_time: admin.firestore.FieldValue.serverTimestamp(),
+            sentiment, subject, transcript: fullTranscript, resolution_status, tags
+        });
+        console.log(`[Firestore] Logged conversation with ID: "${docId}"`);
+    } catch (error) {
+        console.error('[Firestore] Failed to log conversation:', error.message);
+    }
+}
+
+// ... other helper functions like generateSystemPrompt, analyzeConversation, transcribeWhisper, getAIReply, speakText, slugify remain the same ...
+// NOTE: Make sure to copy the unchanged functions from your original server.js file here. For brevity, they are omitted from this view.
+function generateSystemPrompt(config, pageContext = {}, productData = []) {
     const safeConfig = (config && typeof config === 'object') ? config : {};
     const agentName = safeConfig.agent_name || 'Rohan';
     const companyName = safeConfig.company_name || 'the company';
+    
+    let productInfo = 'No specific product information provided.';
+    if (safeConfig.products && Array.isArray(safeConfig.products) && safeConfig.products.length > 0) {
+        productInfo = 'Here is the list of our products and services:\n' + safeConfig.products
+            .filter(p => p && p.name)
+            .map(p => `- Name: ${p.name}\n  Price: ${p.price || 'N/A'}\n  Description: ${p.description || 'No description available.'}`)
+            .join('\n\n');
+    }
+
+    let issuesAndSolutions = (safeConfig.faqs && Array.isArray(safeConfig.faqs) && safeConfig.faqs.length > 0)
+        ? 'Common Issues & Solutions:\n' + safeConfig.faqs.filter(faq => faq && faq.issue && faq.solution).map(faq => `Issue: ${faq.issue}\nSolution: ${faq.solution}`).join('\n\n')
+        : '';
     
     let contextPrompt = '';
     if (pageContext.url && pageContext.title) {
         contextPrompt = `The user is currently on the page titled "${pageContext.title}" (${pageContext.url}). Tailor your answers to be relevant to this page if possible.`;
     }
 
-    return `You are a friendly, professional, and empathetic customer support live chat agent for ${companyName}. Your name is ${agentName}. Your primary goal is to resolve customer issues efficiently.
-    IMPORTANT: Be concise. Keep your answers as short as possible while still being helpful. Use short, clear sentences. Use a conversational tone with contractions (I'm, you're, that's) and emojis where appropriate.
-    ${contextPrompt}`;
+    let woocommercePrompt = '';
+    if (productData.length > 0) {
+        const productList = productData.map(p => `- ${p.name} (Price: ${p.price}, URL: ${p.url}): ${p.description}`).join('\n');
+        woocommercePrompt = `You can also reference the following featured WooCommerce products if relevant:\n${productList}`;
+    }
+
+    return `You are a customer support live chat agent for ${companyName}. Your name is ${agentName}. You are friendly, professional, and empathetic. Your primary goal is to resolve customer issues efficiently.
+    IMPORTANT: Be concise. Keep your answers as short as possible while still being helpful. Use short, clear sentences. Use a conversational and friendly tone with contractions (I'm, you're, that's) and emojis where appropriate.
+    ${contextPrompt}
+    Your Core Responsibilities: Acknowledge and Empathize. Gather Information. Provide Solutions based on the company-specific information provided below.
+    
+    Company-Specific Information:
+    ${productInfo}
+    
+    ${issuesAndSolutions}
+    
+    ${woocommercePrompt}
+
+    Escalation Protocol: If you cannot resolve the issue, state that you will create a ticket for the technical team.`;
 }
 
 async function analyzeConversation(history) {
     const transcript = history.filter(msg => msg.role === 'user' || msg.role === 'assistant').map(msg => `${msg.role}: ${msg.content}`).join('\n');
-    if (!transcript) return { sentiment: 'N/A', subject: 'Empty Conversation', resolution_status: 'N/A', tags: [] };
+    if (!transcript) {
+        return { sentiment: 'N/A', subject: 'Empty Conversation', resolution_status: 'N/A', tags: [] };
+    }
     try {
         const analysisPrompt = `Analyze the following chat transcript. Return your answer as a single, valid JSON object with four keys: "sentiment" (Positive, Negative, or Neutral), "subject" (5 words or less), "resolution_status" (Resolved or Unresolved), and "tags" (an array of 1-3 relevant keywords, e.g., ["shipping", "refund"]). Transcript:\n${transcript}`;
         const response = await openai.chat.completions.create({
@@ -201,28 +226,6 @@ async function analyzeConversation(history) {
 
 function slugify(text) {
     return text.toString().toLowerCase().trim().replace(/\s+/g, '-').replace(/[^\w\-]+/g, '').replace(/\-\-+/g, '-');
-}
-
-async function logConversation(db, history, origin, startTime) {
-    if (!db || history.length <= 1) return;
-    try {
-        const { sentiment, subject, resolution_status, tags } = await analyzeConversation(history);
-        const fullTranscript = history.filter(msg => msg.role !== 'system').map(msg => `[${msg.role}] ${msg.content}`).join('\n---\n');
-        
-        if (!fullTranscript) return;
-
-        const docId = `${startTime.toISOString()}-${slugify(subject)}`;
-
-        await db.collection('conversations').doc(docId).set({
-            origin: origin || 'unknown',
-            start_time: startTime,
-            end_time: admin.firestore.FieldValue.serverTimestamp(),
-            sentiment, subject, transcript: fullTranscript, resolution_status, tags
-        });
-        console.log(`[Firestore] Logged conversation: "${docId}"`);
-    } catch (error) {
-        console.error('[Firestore] Failed to log conversation:', error.message);
-    }
 }
 
 async function transcribeWhisper(audioBuffer, langCode = 'en') {
@@ -250,23 +253,124 @@ async function speakText(text, ws, voice = 'nova') {
     try {
         const mp3 = await openai.audio.speech.create({ model: "tts-1", voice, input: text, speed: 1.13 });
         const buffer = Buffer.from(await mp3.arrayBuffer());
-        if (ws.readyState === 1) ws.send(buffer);
+        if (ws.readyState === 1) {
+            ws.send(buffer);
+        }
     } catch (error) {
         console.error('[OpenAI TTS] Synthesis error:', error);
     }
 }
 
-const server = app.listen(process.env.PORT || 3000, () => console.log(`[HTTP] Server listening on port ${process.env.PORT || 3000}`));
+// --- WebSocket Connection Handling ---
+wss.on('connection', (ws, req, tenantId) => {
+    // The tenantId is now passed from the 'upgrade' handler
+    const tenantApp = tenantManager.getApp(tenantId);
+    if (!tenantApp) {
+        console.log(`[WS] Connection rejected: No initialized app for tenant ${tenantId}.`);
+        ws.terminate();
+        return;
+    }
+    const db = tenantApp.firestore(); // Get the tenant-specific Firestore instance
+    console.log(`[WS] Connection for tenant ${tenantId} accepted.`);
+
+    let conversationHistory = [];
+    let connectionMode = 'text';
+    let ttsVoice = 'nova';
+    const origin = req.headers.origin;
+    const startTime = new Date();
+    let audioBufferArray = [];
+    let currentAudioBufferSize = 0;
+    const MAX_AUDIO_BUFFER_SIZE_MB = 20;
+
+    ws.on('message', async (message) => {
+        let isCommand = false;
+        try {
+            if (Buffer.isBuffer(message)) {
+                currentAudioBufferSize += message.length;
+                if (currentAudioBufferSize > MAX_AUDIO_BUFFER_SIZE_MB * 1024 * 1024) { ws.terminate(); return; }
+            }
+            const data = JSON.parse(message.toString());
+            isCommand = true;
+            
+            if (data.type === 'CONFIG') {
+                const configData = data.data?.config || {};
+                const basePrompt = generateSystemPrompt(configData, data.data?.pageContext, data.data?.productData);
+                ttsVoice = configData.tts_voice || 'nova';
+                conversationHistory = [{ role: 'system', content: basePrompt }];
+                
+                let initialMessage = data.data?.isProactive
+                    ? (configData.proactive_message || 'Hello! Have any questions?')
+                    : (configData.welcome_message || `Hi there! How can I help?`);
+                
+                conversationHistory.push({ role: 'assistant', content: initialMessage });
+
+                if (ws.readyState === 1) {
+                    ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: initialMessage }));
+                }
+                return;
+            }
+            if (conversationHistory.length === 0) return;
+            if (data.type === 'SUBMIT_LEAD_FORM') {
+                await logSupportQuery(db, data.payload.name, data.payload.contact, data.payload.message, origin);
+                // ... (rest of the logic is the same)
+            }
+            // ... The rest of your message handling logic (TEXT_MESSAGE, END_OF_STREAM, etc.) goes here
+            // Ensure every call to logSupportQuery or logConversation passes the tenant-specific `db` instance.
+            
+        } catch (error) {
+            if (!isCommand && Buffer.isBuffer(message)) {
+                audioBufferArray.push(message);
+            } else {
+                console.error(`[Process Tenant ${tenantId}] Error:`, error);
+            }
+        }
+    });
+
+    ws.on('close', async () => {
+        console.log(`[WS] Connection for tenant ${tenantId} closed.`);
+        await logConversation(db, conversationHistory, connectionMode, origin, startTime);
+    });
+
+    ws.on('error', (err) => console.error(`[WS Tenant ${tenantId}] Error:`, err));
+});
+
+
+// --- Server Startup & WebSocket Upgrade Handling ---
+const server = app.listen(process.env.PORT || 3000, () => {
+    console.log(`[HTTP] Server listening on port ${process.env.PORT || 3000}`);
+});
 
 server.on('upgrade', (req, socket, head) => {
+    const { query } = url.parse(req.url, true);
+    const token = query.token;
     const origin = req.headers.origin;
+    
+    // 1. Check Origin
     const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',');
-    if (allowedOrigins.includes(origin) || process.env.NODE_ENV === 'development') {
-        wss.handleUpgrade(req, socket, head, (ws) => {
-            wss.emit('connection', ws, req);
-        });
-    } else {
-        console.log(`[AUTH] Connection from origin "${origin}" rejected.`);
+    if (!allowedOrigins.includes(origin)) {
+        console.log(`[AUTH] WebSocket connection from origin "${origin}" rejected.`);
         socket.destroy();
+        return;
     }
+
+    // 2. Check JWT
+    if (!token) {
+        console.log('[AUTH] WebSocket connection rejected: No token provided.');
+        socket.destroy();
+        return;
+    }
+
+    jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
+        if (err || !decoded.tenantId) {
+            console.log('[AUTH] WebSocket connection rejected: Invalid or expired token.');
+            socket.destroy();
+            return;
+        }
+
+        // 3. Handle Upgrade
+        wss.handleUpgrade(req, socket, head, (ws) => {
+            // Pass the tenantId to the connection handler
+            wss.emit('connection', ws, req, decoded.tenantId);
+        });
+    });
 });

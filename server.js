@@ -19,18 +19,11 @@ if (!process.env.OPENAI_API_KEY || !process.env.JWT_SECRET || !process.env.ALLOW
 }
 
 // --- Firebase Tenant Manager ---
-// Manages dynamic initialization and caching of Firebase app instances for each tenant.
 class FirebaseTenantManager {
     constructor() {
         this.initializedApps = new Map();
     }
-
-    /**
-     * Initializes a Firebase app for a given tenant if it doesn't already exist.
-     * @param {object} serviceAccount The Firebase service account JSON.
-     * @param {string} tenantId The unique ID for the tenant.
-     * @returns {admin.app.App} The initialized Firebase app instance.
-     */
+    
     initializeAppForTenant(serviceAccount, tenantId) {
         if (this.initializedApps.has(tenantId)) {
             return this.initializedApps.get(tenantId);
@@ -39,13 +32,12 @@ class FirebaseTenantManager {
         try {
             const app = admin.initializeApp({
                 credential: admin.credential.cert(serviceAccount),
-            }, tenantId); // Use tenantId as the app name
+            }, tenantId);
             this.initializedApps.set(tenantId, app);
             console.log(`[Firebase] Initialized new app for tenant: ${tenantId}`);
             return app;
         } catch (error) {
             console.error(`[Firebase] Failed to initialize app for tenant ${tenantId}:`, error.message);
-            // If initialization fails, check for a "duplicate app" error which might occur in rare race conditions.
             if (error.code === 'app/duplicate-app' && !this.initializedApps.has(tenantId)) {
                  const existingApp = admin.app(tenantId);
                  this.initializedApps.set(tenantId, existingApp);
@@ -55,11 +47,6 @@ class FirebaseTenantManager {
         }
     }
 
-    /**
-     * Gets an already initialized Firebase app instance for a tenant.
-     * @param {string} tenantId The unique ID for the tenant.
-     * @returns {admin.app.App|null} The app instance or null if not found.
-     */
     getApp(tenantId) {
         return this.initializedApps.get(tenantId) || null;
     }
@@ -69,12 +56,11 @@ const tenantManager = new FirebaseTenantManager();
 
 // --- Express App Setup ---
 const app = express();
-app.use(express.json({ limit: '1mb' })); // Protect against large payloads
+app.use(express.json({ limit: '1mb' }));
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 
 // --- API: Initialize Session ---
-// Receives a Firebase Admin SDK key, validates it, and returns a JWT session token.
 app.post('/api/init-session', (req, res) => {
     const { serviceAccount } = req.body;
 
@@ -83,16 +69,17 @@ app.post('/api/init-session', (req, res) => {
     }
 
     try {
-        // Create a stable, unique ID for the tenant based on their project ID.
-        const tenantId = crypto.createHash('sha256').update(serviceAccount.project_id).digest('hex');
+        // ** THE FIX IS HERE **
+        // This line repairs the private key's newline characters that get corrupted by WordPress.
+        if (serviceAccount.private_key) {
+            serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
+        }
 
-        // Initialize the app. This also serves as validation for the key.
+        const tenantId = crypto.createHash('sha256').update(serviceAccount.project_id).digest('hex');
         tenantManager.initializeAppForTenant(serviceAccount, tenantId);
 
-        // Generate a short-lived JWT for the WebSocket connection
         const token = jwt.sign({ tenantId }, process.env.JWT_SECRET, { expiresIn: '5m' });
         
-        // This URL should be configured in your environment variables for production
         const websocketUrl = process.env.WEBSOCKET_URL || 'wss://your-websocket-server.onrender.com';
         res.json({ success: true, token, websocketUrl });
 

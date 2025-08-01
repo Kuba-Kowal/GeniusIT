@@ -11,20 +11,10 @@ import crypto from 'crypto';
 dotenv.config();
 
 // --- Environment Variable Validation ---
-if (!process.env.OPENAI_API_KEY || !process.env.BVR_ENCRYPTION_KEY || !process.env.ALLOWED_ORIGINS) {
-    console.error("FATAL ERROR: Missing required environment variables (OPENAI_API_KEY, BVR_ENCRYPTION_KEY, ALLOWED_ORIGINS).");
+if (!process.env.OPENAI_API_KEY || !process.env.ALLOWED_ORIGINS) {
+    console.error("FATAL ERROR: Missing required environment variables (OPENAI_API_KEY, ALLOWED_ORIGINS).");
     process.exit(1);
 }
-const ENCRYPTION_KEY = Buffer.from(process.env.BVR_ENCRYPTION_KEY, 'hex');
-if (ENCRYPTION_KEY.length !== 32) {
-    console.error("FATAL ERROR: BVR_ENCRYPTION_KEY must be a 64-character hex string (32 bytes).");
-    process.exit(1);
-}
-
-// --- KEY HASH VERIFICATION ---
-const keyHash = crypto.createHash('sha256').update(process.env.BVR_ENCRYPTION_KEY).digest('hex');
-console.log(`--- Server starting... Render Key Hash: ${keyHash} ---`);
-// --- END VERIFICATION ---
 
 const app = express();
 app.use(express.json());
@@ -34,23 +24,6 @@ const wss = new WebSocketServer({ noServer: true });
 
 // --- Caching for Initialized Firebase Apps ---
 const firebaseAppsCache = new Map();
-
-// --- Decryption Utility ---
-function decrypt(text) {
-    try {
-        const parts = text.split(':');
-        if (parts.length !== 2) throw new Error('Invalid encrypted string format.');
-        const iv = Buffer.from(parts.shift(), 'hex');
-        const encryptedText = Buffer.from(parts.join(':'), 'hex');
-        const decipher = crypto.createDecipheriv('aes-256-cbc', ENCRYPTION_KEY, iv);
-        let decrypted = decipher.update(encryptedText);
-        decrypted = Buffer.concat([decrypted, decipher.final()]);
-        return decrypted.toString();
-    } catch (error) {
-        console.error('[Crypto] Decryption failed:', error.message);
-        throw new Error('Decryption failed.');
-    }
-}
 
 // --- WebSocket Connection Handling ---
 wss.on('connection', (ws, req) => {
@@ -72,30 +45,29 @@ wss.on('connection', (ws, req) => {
                 return ws.terminate();
             }
 
-            const { encryptedFirebaseConfig, firebaseProjectId, config, pageContext, isProactive } = data.data;
+            const { firebaseServiceAccount, config, pageContext, isProactive } = data.data;
 
-            if (!encryptedFirebaseConfig || !firebaseProjectId) {
-                console.log(`[AUTH] IP ${ip} missing credentials in INIT_SESSION. Terminating.`);
+            if (!firebaseServiceAccount || !firebaseServiceAccount.project_id) {
+                console.log(`[AUTH] IP ${ip} missing valid service account in INIT_SESSION. Terminating.`);
                 return ws.terminate();
             }
+            
+            const projectId = firebaseServiceAccount.project_id;
 
             let tenantApp;
-            if (firebaseAppsCache.has(firebaseProjectId)) {
-                tenantApp = firebaseAppsCache.get(firebaseProjectId);
+            if (firebaseAppsCache.has(projectId)) {
+                tenantApp = firebaseAppsCache.get(projectId);
             } else {
-                const decryptedConfigStr = decrypt(encryptedFirebaseConfig);
-                const serviceAccount = JSON.parse(decryptedConfigStr);
-
                 tenantApp = admin.initializeApp({
-                    credential: admin.credential.cert(serviceAccount),
-                }, firebaseProjectId); 
-                firebaseAppsCache.set(firebaseProjectId, tenantApp);
+                    credential: admin.credential.cert(firebaseServiceAccount),
+                }, projectId); // Use unique project ID as app name
+                firebaseAppsCache.set(projectId, tenantApp);
             }
             
             db = tenantApp.firestore();
             ttsVoice = config.tts_voice || 'nova';
 
-            console.log(`[AUTH] Session successfully initialized for tenant: ${firebaseProjectId}`);
+            console.log(`[AUTH] Session successfully initialized for tenant: ${projectId}`);
 
             const basePrompt = generateSystemPrompt(config, pageContext);
             conversationHistory = [{ role: 'system', content: basePrompt }];

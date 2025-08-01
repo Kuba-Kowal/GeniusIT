@@ -177,10 +177,7 @@ wss.on('connection', (ws, req, tenantId) => {
 
     ws.on('message', async (message) => {
         try {
-            // First, assume the message is a JSON command (as a string or buffer)
             const data = JSON.parse(message.toString());
-            
-            // If parsing succeeds, it's a command. Process it.
             if (data.type === 'CONFIG') {
                 const configData = data.data?.config || {};
                 conversationHistory = [{ role: 'system', content: generateSystemPrompt(configData, data.data?.pageContext, data.data?.productData) }];
@@ -224,7 +221,6 @@ wss.on('connection', (ws, req, tenantId) => {
                 }
             }
         } catch (e) {
-            // If JSON.parse fails, it's not a command. Assume it's a binary audio chunk.
             if (Buffer.isBuffer(message)) {
                 currentAudioBufferSize += message.length;
                 if (currentAudioBufferSize > MAX_AUDIO_BUFFER_SIZE_MB * 1024 * 1024) ws.terminate();

@@ -21,6 +21,11 @@ if (ENCRYPTION_KEY.length !== 32) {
     process.exit(1);
 }
 
+// --- KEY HASH VERIFICATION ---
+const keyHash = crypto.createHash('sha256').update(process.env.BVR_ENCRYPTION_KEY).digest('hex');
+console.log(`--- Server starting... Render Key Hash: ${keyHash} ---`);
+// --- END VERIFICATION ---
+
 const app = express();
 app.use(express.json());
 

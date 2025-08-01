@@ -18,6 +18,36 @@ if (!process.env.OPENAI_API_KEY || !process.env.JWT_SECRET || !process.env.ALLOW
     process.exit(1);
 }
 
+// --- NEW HELPER FUNCTION TO FIX CORRUPTED KEYS ---
+/**
+ * Reconstructs a PEM private key that has had its newlines stripped.
+ * @param {string} corruptedKey The private key string from the JSON object.
+ * @returns {string} A correctly formatted PEM private key.
+ */
+function formatPemKey(corruptedKey) {
+    // Isolate the core Base64 key data by removing headers, footers, and all whitespace/newlines.
+    const keyBody = corruptedKey
+        .replace(/-----BEGIN PRIVATE KEY-----/g, '')
+        .replace(/-----END PRIVATE KEY-----/g, '')
+        .replace(/\s/g, '');
+
+    // Re-insert newlines every 64 characters, which is the standard PEM format.
+    const keyChunks = keyBody.match(/.{1,64}/g);
+
+    if (!keyChunks) {
+        // If the key is somehow empty or invalid, return the original to let the error happen naturally.
+        return corruptedKey;
+    }
+
+    // Re-assemble the key into the valid, multi-line PEM format.
+    return [
+        '-----BEGIN PRIVATE KEY-----',
+        ...keyChunks,
+        '-----END PRIVATE KEY-----'
+    ].join('\n');
+}
+
+
 // --- Firebase Tenant Manager ---
 class FirebaseTenantManager {
     constructor() {
@@ -69,10 +99,10 @@ app.post('/api/init-session', (req, res) => {
     }
 
     try {
-        // ** THE FIX IS HERE **
-        // This line repairs the private key's newline characters that get corrupted by WordPress.
+        // ** THE DEFINITIVE FIX IS HERE **
+        // Use the robust formatting function to rebuild the private key.
         if (serviceAccount.private_key) {
-            serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
+            serviceAccount.private_key = formatPemKey(serviceAccount.private_key);
         }
 
         const tenantId = crypto.createHash('sha256').update(serviceAccount.project_id).digest('hex');
@@ -90,11 +120,8 @@ app.post('/api/init-session', (req, res) => {
 });
 
 
-// --- WebSocket Server Setup ---
+// --- WebSocket Server Setup & Full Core Logic ---
 const wss = new WebSocketServer({ noServer: true });
-
-
-// --- Core Application Logic (Refactored for Multi-Tenancy) ---
 
 async function logSupportQuery(db, name, contact, message, origin) {
     if (!db) {
@@ -259,7 +286,6 @@ async function speakText(text, ws, voice = 'nova') {
     }
 }
 
-// --- WebSocket Connection Handling ---
 wss.on('connection', (ws, req, tenantId) => {
     const tenantApp = tenantManager.getApp(tenantId);
     if (!tenantApp) {
@@ -267,7 +293,7 @@ wss.on('connection', (ws, req, tenantId) => {
         ws.terminate();
         return;
     }
-    const db = tenantApp.firestore(); // Get the tenant-specific Firestore instance
+    const db = tenantApp.firestore();
     console.log(`[WS] Connection for tenant ${tenantId} accepted.`);
 
     let conversationHistory = [];
@@ -285,7 +311,6 @@ wss.on('connection', (ws, req, tenantId) => {
             if (Buffer.isBuffer(message)) {
                 currentAudioBufferSize += message.length;
                 if (currentAudioBufferSize > MAX_AUDIO_BUFFER_SIZE_MB * 1024 * 1024) {
-                    console.log(`[WS Tenant ${tenantId}] Terminating due to excessive audio buffer size.`);
                     ws.terminate();
                     return;
                 }
@@ -297,7 +322,6 @@ wss.on('connection', (ws, req, tenantId) => {
                 const configData = data.data?.config || {};
                 const pageContext = data.data?.pageContext || {};
                 const productData = data.data?.productData || [];
-
                 const basePrompt = generateSystemPrompt(configData, pageContext, productData);
                 ttsVoice = configData.tts_voice || 'nova';
                 conversationHistory = [{ role: 'system', content: basePrompt }];
@@ -307,18 +331,11 @@ wss.on('connection', (ws, req, tenantId) => {
                     : (configData.welcome_message || `Hi there! My name is ${configData.agent_name || 'AI Agent'}. How can I help you today? 👋`);
                 
                 conversationHistory.push({ role: 'assistant', content: initialMessage });
-
-                if (ws.readyState === 1) {
-                    ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: initialMessage }));
-                }
-                console.log(`[WS Tenant ${tenantId}] Session initialized. Proactive: ${!!data.data?.isProactive}`);
+                if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: initialMessage }));
                 return;
             }
 
-            if (conversationHistory.length === 0) {
-                console.log(`[WS Tenant ${tenantId}] Ignoring message: Session not yet initialized with CONFIG.`);
-                return;
-            }
+            if (conversationHistory.length === 0) return;
             
             if (data.type === 'SUBMIT_LEAD_FORM') {
                 const { name, contact, message } = data.payload;
@@ -327,9 +344,7 @@ wss.on('connection', (ws, req, tenantId) => {
                 conversationHistory.push({ role: 'metadata', content: leadInfoForTranscript });
                 const confirmationMessage = `Thank you, ${name}! Your request has been received. An agent will be in touch at ${contact} as soon as possible.`;
                 conversationHistory.push({ role: 'assistant', content: confirmationMessage });
-                if (ws.readyState === 1) {
-                    ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: confirmationMessage }));
-                }
+                if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: confirmationMessage }));
                 return;
             }
 
@@ -353,7 +368,6 @@ wss.on('connection', (ws, req, tenantId) => {
                 conversationHistory.push({ role: 'user', content: transcript });
                 const reply = await getAIReply(conversationHistory);
                 conversationHistory.push({ role: 'assistant', content: reply });
-
                 if (connectionMode === 'voice') {
                     ws.send(JSON.stringify({ type: 'AI_RESPONSE_PENDING_AUDIO', text: reply }));
                     await speakText(reply, ws, ttsVoice);
@@ -382,8 +396,6 @@ wss.on('connection', (ws, req, tenantId) => {
     ws.on('error', (err) => console.error(`[WS Tenant ${tenantId}] Connection error:`, err));
 });
 
-
-// --- Server Startup & WebSocket Upgrade Handling ---
 const server = app.listen(process.env.PORT || 3000, () => {
     console.log(`[HTTP] Server listening on port ${process.env.PORT || 3000}`);
 });
@@ -393,31 +405,24 @@ server.on('upgrade', (req, socket, head) => {
     const token = query.token;
     const origin = req.headers.origin;
     
-    // 1. Check Origin
     const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',');
     if (!allowedOrigins.includes(origin)) {
-        console.log(`[AUTH] WebSocket connection from origin "${origin}" rejected.`);
         socket.destroy();
         return;
     }
 
-    // 2. Check JWT
     if (!token) {
-        console.log('[AUTH] WebSocket connection rejected: No token provided.');
         socket.destroy();
         return;
     }
 
     jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
         if (err || !decoded.tenantId) {
-            console.log('[AUTH] WebSocket connection rejected: Invalid or expired token.');
             socket.destroy();
             return;
         }
 
-        // 3. Handle Upgrade
         wss.handleUpgrade(req, socket, head, (ws) => {
-            // Pass the tenantId to the connection handler
             wss.emit('connection', ws, req, decoded.tenantId);
         });
     });

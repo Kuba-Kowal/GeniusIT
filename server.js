@@ -54,7 +54,7 @@ const app = express();
 app.use(express.json({ limit: '1mb' }));
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// --- API: Initialize Session ---
+// --- API: Initialize Chat Session ---
 app.post('/api/init-session', (req, res) => {
     const { serviceAccount } = req.body;
     if (!serviceAccount || typeof serviceAccount !== 'object' || !serviceAccount.project_id) {
@@ -69,6 +69,72 @@ app.post('/api/init-session', (req, res) => {
     } catch (error) {
         console.error('[AUTH] Service account validation failed:', error.message);
         res.status(401).json({ success: false, message: 'The provided Firebase service account key is invalid.' });
+    }
+});
+
+// --- NEW API: Fetch Analytics Data ---
+app.post('/api/analytics', async (req, res) => {
+    const { serviceAccount } = req.body;
+    if (!serviceAccount || typeof serviceAccount !== 'object' || !serviceAccount.project_id) {
+        return res.status(400).json({ success: false, message: 'Invalid or missing Firebase service account key.' });
+    }
+    try {
+        const tenantId = crypto.createHash('sha256').update(serviceAccount.project_id).digest('hex');
+        const tenantApp = tenantManager.initializeAppForTenant(serviceAccount, tenantId);
+        const db = tenantApp.firestore();
+
+        // 1. Fetch all conversations to calculate stats
+        const allConversationsSnapshot = await db.collection('conversations').get();
+        let totalConversations = 0;
+        let resolvedCount = 0;
+        let ratedConversations = 0; // Conversations with a status of Resolved or Unresolved
+
+        allConversationsSnapshot.forEach(doc => {
+            totalConversations++;
+            const data = doc.data();
+            if (data.resolution_status === 'Resolved') {
+                resolvedCount++;
+                ratedConversations++;
+            } else if (data.resolution_status === 'Unresolved') {
+                ratedConversations++;
+            }
+        });
+
+        const successRate = (ratedConversations > 0) ? Math.round((resolvedCount / ratedConversations) * 100) : 0;
+
+        // 2. Fetch recent conversations
+        const recentConversationsSnapshot = await db.collection('conversations')
+            .orderBy('start_time', 'desc')
+            .limit(15)
+            .get();
+            
+        const recentConversations = [];
+        recentConversationsSnapshot.forEach(doc => {
+            const data = doc.data();
+            recentConversations.push({
+                id: doc.id,
+                subject: data.subject || 'No Subject',
+                status: data.resolution_status || 'N/A',
+                // Convert Firestore Timestamp to ISO string for JSON transport
+                date: data.start_time.toDate().toISOString(),
+                transcript: data.transcript || ''
+            });
+        });
+
+        res.json({
+            success: true,
+            data: {
+                stats: {
+                    totalConversations,
+                    successRate
+                },
+                recent: recentConversations
+            }
+        });
+
+    } catch (error) {
+        console.error(`[ANALYTICS] Failed to fetch analytics for tenant:`, error.message);
+        res.status(500).json({ success: false, message: 'Failed to fetch analytics data.' });
     }
 });
 
@@ -103,7 +169,6 @@ function generateSystemPrompt(config, pageContext = {}, preChatData = null) {
     return `${basePrompt} ${contextPrompt} Your Core Responsibilities: Acknowledge and Empathize. Gather Information. Provide Solutions based on the company-specific information provided below. Company-Specific Information: ${productInfo} ${issuesAndSolutions} Escalation Protocol: If you cannotresolve the issue, state that you will create a ticket for the technical team. After providing a solution, ask the user "Has this resolved your issue?".`;
 }
 
-
 async function analyzeConversation(history, userConfirmation = null) {
     const transcript = history.filter(msg => msg.role === 'user' || msg.role === 'assistant').map(msg => `${msg.role}: ${msg.content}`).join('\n');
     if (!transcript) {
@@ -121,10 +186,8 @@ async function analyzeConversation(history, userConfirmation = null) {
 
         let analysis = JSON.parse(response.choices[0].message.content);
 
-        // Override AI analysis if the user has explicitly confirmed resolution.
         if (userConfirmation === "Resolved") {
             analysis.resolution_status = "Resolved";
-            // If the user confirms resolution, we can infer the intent was a question.
             if (analysis.intent === "General Chat/Greeting") {
                 analysis.intent = "Question/Issue";
             }
@@ -222,7 +285,7 @@ wss.on('connection', (ws, req, tenantId) => {
     let conversationHistory = [], connectionMode = 'text', ttsVoice = 'nova', audioBufferArray = [], currentAudioBufferSize = 0;
     const origin = req.headers.origin, startTime = new Date(), MAX_AUDIO_BUFFER_SIZE_MB = 20;
     let conversationLogged = false;
-    let preChatData = null; // Store pre-chat data for the session
+    let preChatData = null;
 
     ws.on('message', async (message) => {
         try {
@@ -230,11 +293,10 @@ wss.on('connection', (ws, req, tenantId) => {
             
             if (data.type === 'CONFIG') {
                 const configData = data.data?.config || {};
-                preChatData = data.data?.preChatData || null; // Capture pre-chat data
+                preChatData = data.data?.preChatData || null;
                 conversationHistory = [{ role: 'system', content: generateSystemPrompt(configData, data.data?.pageContext, preChatData) }];
                 
                 if (preChatData && preChatData.name) {
-                    // Add user's name as metadata for the AI, but it won't be displayed in the chat
                     conversationHistory.push({ role: 'metadata', content: `The user's name is ${preChatData.name}.` });
                 }
                 
@@ -317,16 +379,15 @@ wss.on('connection', (ws, req, tenantId) => {
     ws.on('error', (err) => console.error(`[WS Tenant ${tenantId}] Connection error:`, err));
 });
 
+// --- Server Startup ---
 const server = app.listen(process.env.PORT || 3000, () => { console.log(`[HTTP] Server listening on port ${process.env.PORT || 3000}`); });
 
 server.on('upgrade', (req, socket, head) => {
     const origin = req.headers.origin;
     const allowedOriginsEnv = process.env.ALLOWED_ORIGINS || '';
-
-    // Authorization: Check if the request origin is allowed
     let isOriginAllowed = false;
     if (allowedOriginsEnv === '*') {
-        isOriginAllowed = true; // Wildcard allows all origins
+        isOriginAllowed = true;
     } else {
         const allowedOriginsList = allowedOriginsEnv.split(',');
         if (allowedOriginsList.includes(origin)) {
@@ -343,20 +404,17 @@ server.on('upgrade', (req, socket, head) => {
     try {
         const requestUrl = new URL(req.url, `ws://${req.headers.host}`);
         const token = requestUrl.searchParams.get('token');
-
         if (!token) {
             console.error('[WS Upgrade] Blocked request: No token provided.');
             socket.destroy();
             return;
         }
-
         jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
             if (err || !decoded.tenantId) {
                 console.error('[WS Upgrade] Blocked request: Invalid or expired token.');
                 socket.destroy();
                 return;
             }
-            // If all checks pass, handle the WebSocket upgrade
             wss.handleUpgrade(req, socket, head, (ws) => {
                 wss.emit('connection', ws, req, decoded.tenantId);
             });

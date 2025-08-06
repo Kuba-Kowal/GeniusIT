@@ -8,7 +8,6 @@ import dotenv from 'dotenv';
 import admin from 'firebase-admin';
 import crypto from 'crypto';
 import jwt from 'jsonwebtoken';
-import url from 'url';
 
 dotenv.config();
 
@@ -285,15 +284,51 @@ wss.on('connection', (ws, req, tenantId) => {
 });
 
 const server = app.listen(process.env.PORT || 3000, () => { console.log(`[HTTP] Server listening on port ${process.env.PORT || 3000}`); });
+
 server.on('upgrade', (req, socket, head) => {
-    const { query } = url.parse(req.url, true);
-    const token = query.token;
     const origin = req.headers.origin;
-    const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',');
-    if (!allowedOrigins.includes(origin)) { socket.destroy(); return; }
-    if (!token) { socket.destroy(); return; }
-    jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
-        if (err || !decoded.tenantId) { socket.destroy(); return; }
-        wss.handleUpgrade(req, socket, head, (ws) => { wss.emit('connection', ws, req, decoded.tenantId); });
-    });
+    const allowedOriginsEnv = process.env.ALLOWED_ORIGINS || '';
+
+    // Authorization: Check if the request origin is allowed
+    let isOriginAllowed = false;
+    if (allowedOriginsEnv === '*') {
+        isOriginAllowed = true; // Wildcard allows all origins
+    } else {
+        const allowedOriginsList = allowedOriginsEnv.split(',');
+        if (allowedOriginsList.includes(origin)) {
+            isOriginAllowed = true;
+        }
+    }
+
+    if (!isOriginAllowed) {
+        console.error(`[WS Upgrade] Blocked origin: '${origin}'. It is not in the allowed list: '${allowedOriginsEnv}'`);
+        socket.destroy();
+        return;
+    }
+    
+    try {
+        const requestUrl = new URL(req.url, `ws://${req.headers.host}`);
+        const token = requestUrl.searchParams.get('token');
+
+        if (!token) {
+            console.error('[WS Upgrade] Blocked request: No token provided.');
+            socket.destroy();
+            return;
+        }
+
+        jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
+            if (err || !decoded.tenantId) {
+                console.error('[WS Upgrade] Blocked request: Invalid or expired token.');
+                socket.destroy();
+                return;
+            }
+            // If all checks pass, handle the WebSocket upgrade
+            wss.handleUpgrade(req, socket, head, (ws) => {
+                wss.emit('connection', ws, req, decoded.tenantId);
+            });
+        });
+    } catch (error) {
+        console.error('[WS Upgrade] Error processing upgrade request:', error);
+        socket.destroy();
+    }
 });

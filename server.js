@@ -85,23 +85,24 @@ async function logSupportQuery(db, name, contact, message, origin) {
     } catch (error) { console.error('[Firestore] Failed to log support query:', error.message); }
 }
 
-function generateSystemPrompt(config, pageContext = {}, productData = []) {
+function generateSystemPrompt(config, pageContext = {}, preChatData = null) {
     const safeConfig = config || {};
     const agentName = safeConfig.agent_name || 'AI Agent';
     const companyName = safeConfig.company_name || 'the company';
-    let productInfo = 'No specific product information provided.';
-    if (safeConfig.products && Array.isArray(safeConfig.products) && safeConfig.products.length > 0) {
-        productInfo = 'Here is the list of our products and services:\n' + safeConfig.products.filter(p => p && p.name).map(p => `- Name: ${p.name}\n  Price: ${p.price || 'N/A'}\n  Description: ${p.description || 'No description available.'}`).join('\n\n');
+    
+    let basePrompt = `You are a customer support live chat agent for ${companyName}. Your name is ${agentName}. You are friendly, professional, and empathetic. Your primary goal is to resolve customer issues efficiently. IMPORTANT: Be concise. Keep your answers as short as possible while still being helpful. Use short, clear sentences. Use a conversational and friendly tone with contractions (I'm, you're, that's) and emojis where appropriate.`;
+    
+    if (preChatData && preChatData.name) {
+        basePrompt += ` The user's name is ${preChatData.name}. Address them by their name to provide a personal touch when appropriate.`;
     }
+
+    let productInfo = (safeConfig.products && Array.isArray(safeConfig.products) && safeConfig.products.length > 0) ? 'Here is the list of our products and services:\n' + safeConfig.products.filter(p => p && p.name).map(p => `- Name: ${p.name}\n  Price: ${p.price || 'N/A'}\n  Description: ${p.description || 'No description available.'}`).join('\n\n') : 'No specific product information provided.';
     let issuesAndSolutions = (safeConfig.faqs && Array.isArray(safeConfig.faqs) && safeConfig.faqs.length > 0) ? 'Common Issues & Solutions:\n' + safeConfig.faqs.filter(faq => faq && faq.issue && faq.solution).map(faq => `Issue: ${faq.issue}\nSolution: ${faq.solution}`).join('\n\n') : '';
     let contextPrompt = pageContext.url && pageContext.title ? `The user is currently on the page titled "${pageContext.title}" (${pageContext.url}). Tailor your answers to be relevant to this page if possible.` : '';
-    let woocommercePrompt = '';
-    if (productData.length > 0) {
-        const productList = productData.map(p => `- Name: ${p.name} (Price: ${p.price}, URL: ${p.url}): ${p.description}`).join('\n');
-        woocommercePrompt = `You can also reference the following featured WooCommerce products if relevant:\n${productList}`;
-    }
-    return `You are a customer support live chat agent for ${companyName}. Your name is ${agentName}. You are friendly, professional, and empathetic. Your primary goal is to resolve customer issues efficiently. IMPORTANT: Be concise. Keep your answers as short as possible while still being helpful. Use short, clear sentences. Use a conversational and friendly tone with contractions (I'm, you're, that's) and emojis where appropriate. ${contextPrompt} Your Core Responsibilities: Acknowledge and Empathize. Gather Information. Provide Solutions based on the company-specific information provided below. Company-Specific Information: ${productInfo} ${issuesAndSolutions} ${woocommercePrompt} Escalation Protocol: If you cannot resolve the issue, state that you will create a ticket for the technical team. After providing a solution, ask the user "Has this resolved your issue?".`;
+
+    return `${basePrompt} ${contextPrompt} Your Core Responsibilities: Acknowledge and Empathize. Gather Information. Provide Solutions based on the company-specific information provided below. Company-Specific Information: ${productInfo} ${issuesAndSolutions} Escalation Protocol: If you cannotresolve the issue, state that you will create a ticket for the technical team. After providing a solution, ask the user "Has this resolved your issue?".`;
 }
+
 
 async function analyzeConversation(history, userConfirmation = null) {
     const transcript = history.filter(msg => msg.role === 'user' || msg.role === 'assistant').map(msg => `${msg.role}: ${msg.content}`).join('\n');
@@ -147,16 +148,25 @@ function slugify(text) {
     return text.toString().toLowerCase().trim().replace(/\s+/g, '-').replace(/[^\w\-]+/g, '').replace(/\-\-+/g, '-');
 }
 
-async function logConversation(db, history, interactionType, origin, startTime, userConfirmation = null) {
+async function logConversation(db, history, interactionType, origin, startTime, preChatData, userConfirmation = null) {
     if (!db || history.length <= 1) return;
     try {
         const { sentiment, subject, resolution_status, tags, intent } = await analyzeConversation(history, userConfirmation);
-        const fullTranscript = history.filter(msg => msg.role !== 'system').map(msg => msg.role === 'metadata' ? `[SYSTEM] ${msg.content}` : `[${msg.role}] ${msg.content}`).join('\n---\n');
-        if (!fullTranscript) return;
+        
+        let transcriptHeader = '';
+        if (preChatData) {
+            transcriptHeader = `User Details:\nName: ${preChatData.name || 'Not Provided'}\nEmail: ${preChatData.email || 'Not Provided'}\n\n---\n`;
+        }
+        
+        const fullTranscript = transcriptHeader + history.filter(msg => msg.role !== 'system').map(msg => `[${msg.role}] ${msg.content}`).join('\n---\n');
+        
+        if (!fullTranscript.trim()) return;
+        
         const date = new Date(startTime);
         const timestamp = `${date.getFullYear()}${(date.getMonth()+1).toString().padStart(2, '0')}${date.getDate().toString().padStart(2, '0')}-${date.getHours().toString().padStart(2, '0')}${date.getMinutes().toString().padStart(2, '0')}`;
         const docId = `${timestamp}-${slugify(subject) || 'conversation'}`;
-        await db.collection('conversations').doc(docId).set({
+        
+        const logData = {
             interaction_type: interactionType,
             origin: origin || 'unknown',
             start_time: startTime,
@@ -165,9 +175,16 @@ async function logConversation(db, history, interactionType, origin, startTime, 
             subject,
             transcript: fullTranscript,
             resolution_status,
-            intent, // Save the new intent field
+            intent,
             tags
-        });
+        };
+
+        if (preChatData) {
+            logData.user_name = preChatData.name || null;
+            logData.user_email = preChatData.email || null;
+        }
+
+        await db.collection('conversations').doc(docId).set(logData);
         console.log(`[Firestore] Logged conversation with ID: "${docId}", Intent: ${intent}, Status: ${resolution_status}`);
     } catch (error) { console.error('[Firestore] Failed to log conversation:', error.message); }
 }
@@ -201,27 +218,39 @@ wss.on('connection', (ws, req, tenantId) => {
     if (!tenantApp) { ws.terminate(); return; }
     const db = tenantApp.firestore();
     console.log(`[WS] Connection for tenant ${tenantId} accepted.`);
+    
     let conversationHistory = [], connectionMode = 'text', ttsVoice = 'nova', audioBufferArray = [], currentAudioBufferSize = 0;
     const origin = req.headers.origin, startTime = new Date(), MAX_AUDIO_BUFFER_SIZE_MB = 20;
     let conversationLogged = false;
+    let preChatData = null; // Store pre-chat data for the session
 
     ws.on('message', async (message) => {
         try {
             const data = JSON.parse(message.toString());
+            
             if (data.type === 'CONFIG') {
                 const configData = data.data?.config || {};
-                conversationHistory = [{ role: 'system', content: generateSystemPrompt(configData, data.data?.pageContext, data.data?.productData) }];
+                preChatData = data.data?.preChatData || null; // Capture pre-chat data
+                conversationHistory = [{ role: 'system', content: generateSystemPrompt(configData, data.data?.pageContext, preChatData) }];
+                
+                if (preChatData && preChatData.name) {
+                    // Add user's name as metadata for the AI, but it won't be displayed in the chat
+                    conversationHistory.push({ role: 'metadata', content: `The user's name is ${preChatData.name}.` });
+                }
+                
                 ttsVoice = configData.tts_voice || 'nova';
                 let initialMessage = data.data?.isProactive ? (configData.proactive_message || 'Hello! Have any questions?') : (configData.welcome_message || `Hi there! How can I help?`);
                 conversationHistory.push({ role: 'assistant', content: initialMessage });
+                
                 if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: initialMessage }));
                 return;
             }
+
             if (conversationHistory.length === 0) return;
             
             if (data.type === 'ISSUE_RESOLVED_CONFIRMATION') {
                 console.log(`[WS] User confirmed resolution for tenant ${tenantId}.`);
-                await logConversation(db, conversationHistory, connectionMode, origin, startTime, "Resolved");
+                await logConversation(db, conversationHistory, connectionMode, origin, startTime, preChatData, "Resolved");
                 conversationLogged = true;
                 if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: "Great! Thanks for confirming. Have a nice day!" }));
                 setTimeout(() => ws.close(), 2000);
@@ -267,19 +296,24 @@ wss.on('connection', (ws, req, tenantId) => {
         } catch (e) {
             if (Buffer.isBuffer(message)) {
                 currentAudioBufferSize += message.length;
-                if (currentAudioBufferSize > MAX_AUDIO_BUFFER_SIZE_MB * 1024 * 1024) ws.terminate();
-                else audioBufferArray.push(message);
+                if (currentAudioBufferSize > MAX_AUDIO_BUFFER_SIZE_MB * 1024 * 1024) {
+                    ws.terminate();
+                } else {
+                    audioBufferArray.push(message);
+                }
             } else {
                 console.error(`[Process Tenant ${tenantId}] Received invalid message:`, message);
             }
         }
     });
+    
     ws.on('close', async () => {
         console.log(`[WS] Connection for tenant ${tenantId} closed.`);
         if (!conversationLogged) {
-            await logConversation(db, conversationHistory, connectionMode, origin, startTime);
+            await logConversation(db, conversationHistory, connectionMode, origin, startTime, preChatData);
         }
     });
+
     ws.on('error', (err) => console.error(`[WS Tenant ${tenantId}] Connection error:`, err));
 });
 

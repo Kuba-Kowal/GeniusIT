@@ -54,7 +54,7 @@ const app = express();
 app.use(express.json({ limit: '1mb' }));
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// --- API Endpoints ---
+// --- API: Initialize Chat Session ---
 app.post('/api/init-session', (req, res) => {
     const { serviceAccount } = req.body;
     if (!serviceAccount || typeof serviceAccount !== 'object' || !serviceAccount.project_id) {
@@ -72,6 +72,7 @@ app.post('/api/init-session', (req, res) => {
     }
 });
 
+// --- API: Fetch Analytics Data ---
 app.post('/api/analytics', async (req, res) => {
     const { serviceAccount } = req.body;
     if (!serviceAccount || typeof serviceAccount !== 'object' || !serviceAccount.project_id) {
@@ -99,6 +100,7 @@ app.post('/api/analytics', async (req, res) => {
         });
 
         const successRate = (ratedConversations > 0) ? Math.round((resolvedCount / ratedConversations) * 100) : 0;
+        const resolutionRate = (totalConversations > 0) ? Math.round((ratedConversations / totalConversations) * 100) : 0;
 
         const recentConversationsSnapshot = await db.collection('conversations').orderBy('start_time', 'desc').limit(15).get();
         const recentConversations = [];
@@ -113,7 +115,7 @@ app.post('/api/analytics', async (req, res) => {
             });
         });
 
-        res.json({ success: true, data: { stats: { totalConversations, successRate }, recent: recentConversations } });
+        res.json({ success: true, data: { stats: { totalConversations, successRate, resolutionRate }, recent: recentConversations } });
     } catch (error) {
         console.error(`[ANALYTICS] Failed to fetch analytics for tenant:`, error.message);
         res.status(500).json({ success: false, message: 'Failed to fetch analytics data.' });
@@ -137,14 +139,22 @@ function generateSystemPrompt(config, pageContext = {}, preChatData = null) {
     const safeConfig = config || {};
     const agentName = safeConfig.agent_name || 'AI Agent';
     const companyName = safeConfig.company_name || 'the company';
-    let basePrompt = `You are a customer support live chat agent for ${companyName}. Your name is ${agentName}. You are friendly, professional, and empathetic. Your primary goal is to resolve customer issues efficiently. IMPORTANT: Be concise. Keep your answers as short as possible while still being helpful. Use short, clear sentences. Use a conversational and friendly tone with contractions (I'm, you're, that's) and emojis where appropriate.`;
+    
+    let basePrompt = `You are a customer support live chat agent for ${companyName}. Your name is ${agentName}. You are friendly, professional, and empathetic. Your primary goal is to resolve customer issues efficiently.`;
+    
     if (preChatData && preChatData.name) {
-        basePrompt += ` The user's name is ${preChatData.name}. Address them by their name to provide a personal touch when appropriate.`;
+        basePrompt += ` The user's name is ${preChatData.name}. Address them by their name to provide a personal touch.`;
     }
-    let productInfo = (safeConfig.products && Array.isArray(safeConfig.products) && safeConfig.products.length > 0) ? 'Here is the list of our products and services:\n' + safeConfig.products.filter(p => p && p.name).map(p => `- Name: ${p.name}\n  Price: ${p.price || 'N/A'}\n  Description: ${p.description || 'No description available.'}`).join('\n\n') : 'No specific product information provided.';
-    let issuesAndSolutions = (safeConfig.faqs && Array.isArray(safeConfig.faqs) && safeConfig.faqs.length > 0) ? 'Common Issues & Solutions:\n' + safeConfig.faqs.filter(faq => faq && faq.issue && faq.solution).map(faq => `Issue: ${faq.issue}\nSolution: ${faq.solution}`).join('\n\n') : '';
-    let contextPrompt = pageContext.url && pageContext.title ? `The user is currently on the page titled "${pageContext.title}" (${pageContext.url}). Tailor your answers to be relevant to this page if possible.` : '';
-    return `${basePrompt} ${contextPrompt} Your Core Responsibilities: Acknowledge and Empathize. Gather Information. Provide Solutions based on the company-specific information provided below. Company-Specific Information: ${productInfo} ${issuesAndSolutions} Escalation Protocol: If you cannotresolve the issue, state that you will create a ticket for the technical team. After providing a solution, ask the user "Has this resolved your issue?".`;
+
+    let businessContextPrompt = '';
+    if (safeConfig.business_context && safeConfig.business_context.trim() !== '') {
+        businessContextPrompt = `\n\n=== Core Business Context ===\nYou MUST strictly follow this business context. Do not invent services, policies, or information outside of this description. This is your primary source of truth:\n${safeConfig.business_context}`;
+    }
+
+    let productInfo = (safeConfig.products && Array.isArray(safeConfig.products) && safeConfig.products.length > 0) ? '\n\nKnown Products/Services:\n' + safeConfig.products.filter(p => p && p.name).map(p => `- Name: ${p.name}\n  Description: ${p.description || 'No description.'}`).join('\n') : '';
+    let contextPrompt = pageContext.url && pageContext.title ? ` The user is currently on the page titled "${pageContext.title}" (${pageContext.url}).` : '';
+
+    return `${basePrompt} ${contextPrompt}${businessContextPrompt}${productInfo}\n\nEscalation Protocol: If you cannot resolve the issue with the information you have, state that you will create a ticket for the support team. After providing a solution, always ask the user "Has this resolved your issue?".`;
 }
 
 async function analyzeConversation(history, userConfirmation = null) {
@@ -201,7 +211,6 @@ async function analyzeConversation(history, userConfirmation = null) {
         return { sentiment: 'Error', subject: 'Analysis Failed', relevance: 'Error', resolution_status: 'Error', tags: [], intent: 'Error' };
     }
 }
-
 
 function slugify(text) {
     if (!text) return '';
@@ -388,7 +397,9 @@ server.on('upgrade', (req, socket, head) => {
         if (!token) { console.error('[WS Upgrade] Blocked request: No token provided.'); socket.destroy(); return; }
         jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
             if (err || !decoded.tenantId) { console.error('[WS Upgrade] Blocked request: Invalid or expired token.'); socket.destroy(); return; }
-            wss.handleUpgrade(req, socket, head, (ws) => { wss.emit('connection', ws, req, decoded.tenantId); });
+            wss.handleUpgrade(req, socket, head, (ws) => {
+                wss.emit('connection', ws, req, decoded.tenantId);
+            });
         });
     } catch (error) { console.error('[WS Upgrade] Error processing upgrade request:', error); socket.destroy(); }
 });

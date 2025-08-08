@@ -54,7 +54,7 @@ const app = express();
 app.use(express.json({ limit: '1mb' }));
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// --- API: Initialize Chat Session ---
+// --- API Endpoints ---
 app.post('/api/init-session', (req, res) => {
     const { serviceAccount } = req.body;
     if (!serviceAccount || typeof serviceAccount !== 'object' || !serviceAccount.project_id) {
@@ -72,7 +72,6 @@ app.post('/api/init-session', (req, res) => {
     }
 });
 
-// --- NEW API: Fetch Analytics Data ---
 app.post('/api/analytics', async (req, res) => {
     const { serviceAccount } = req.body;
     if (!serviceAccount || typeof serviceAccount !== 'object' || !serviceAccount.project_id) {
@@ -83,11 +82,10 @@ app.post('/api/analytics', async (req, res) => {
         const tenantApp = tenantManager.initializeAppForTenant(serviceAccount, tenantId);
         const db = tenantApp.firestore();
 
-        // 1. Fetch all conversations to calculate stats
         const allConversationsSnapshot = await db.collection('conversations').get();
         let totalConversations = 0;
         let resolvedCount = 0;
-        let ratedConversations = 0; // Conversations with a status of Resolved or Unresolved
+        let ratedConversations = 0;
 
         allConversationsSnapshot.forEach(doc => {
             totalConversations++;
@@ -102,12 +100,7 @@ app.post('/api/analytics', async (req, res) => {
 
         const successRate = (ratedConversations > 0) ? Math.round((resolvedCount / ratedConversations) * 100) : 0;
 
-        // 2. Fetch recent conversations
-        const recentConversationsSnapshot = await db.collection('conversations')
-            .orderBy('start_time', 'desc')
-            .limit(15)
-            .get();
-            
+        const recentConversationsSnapshot = await db.collection('conversations').orderBy('start_time', 'desc').limit(15).get();
         const recentConversations = [];
         recentConversationsSnapshot.forEach(doc => {
             const data = doc.data();
@@ -115,23 +108,12 @@ app.post('/api/analytics', async (req, res) => {
                 id: doc.id,
                 subject: data.subject || 'No Subject',
                 status: data.resolution_status || 'N/A',
-                // Convert Firestore Timestamp to ISO string for JSON transport
                 date: data.start_time.toDate().toISOString(),
                 transcript: data.transcript || ''
             });
         });
 
-        res.json({
-            success: true,
-            data: {
-                stats: {
-                    totalConversations,
-                    successRate
-                },
-                recent: recentConversations
-            }
-        });
-
+        res.json({ success: true, data: { stats: { totalConversations, successRate }, recent: recentConversations } });
     } catch (error) {
         console.error(`[ANALYTICS] Failed to fetch analytics for tenant:`, error.message);
         res.status(500).json({ success: false, message: 'Failed to fetch analytics data.' });
@@ -155,28 +137,41 @@ function generateSystemPrompt(config, pageContext = {}, preChatData = null) {
     const safeConfig = config || {};
     const agentName = safeConfig.agent_name || 'AI Agent';
     const companyName = safeConfig.company_name || 'the company';
-    
     let basePrompt = `You are a customer support live chat agent for ${companyName}. Your name is ${agentName}. You are friendly, professional, and empathetic. Your primary goal is to resolve customer issues efficiently. IMPORTANT: Be concise. Keep your answers as short as possible while still being helpful. Use short, clear sentences. Use a conversational and friendly tone with contractions (I'm, you're, that's) and emojis where appropriate.`;
-    
     if (preChatData && preChatData.name) {
         basePrompt += ` The user's name is ${preChatData.name}. Address them by their name to provide a personal touch when appropriate.`;
     }
-
     let productInfo = (safeConfig.products && Array.isArray(safeConfig.products) && safeConfig.products.length > 0) ? 'Here is the list of our products and services:\n' + safeConfig.products.filter(p => p && p.name).map(p => `- Name: ${p.name}\n  Price: ${p.price || 'N/A'}\n  Description: ${p.description || 'No description available.'}`).join('\n\n') : 'No specific product information provided.';
     let issuesAndSolutions = (safeConfig.faqs && Array.isArray(safeConfig.faqs) && safeConfig.faqs.length > 0) ? 'Common Issues & Solutions:\n' + safeConfig.faqs.filter(faq => faq && faq.issue && faq.solution).map(faq => `Issue: ${faq.issue}\nSolution: ${faq.solution}`).join('\n\n') : '';
     let contextPrompt = pageContext.url && pageContext.title ? `The user is currently on the page titled "${pageContext.title}" (${pageContext.url}). Tailor your answers to be relevant to this page if possible.` : '';
-
     return `${basePrompt} ${contextPrompt} Your Core Responsibilities: Acknowledge and Empathize. Gather Information. Provide Solutions based on the company-specific information provided below. Company-Specific Information: ${productInfo} ${issuesAndSolutions} Escalation Protocol: If you cannotresolve the issue, state that you will create a ticket for the technical team. After providing a solution, ask the user "Has this resolved your issue?".`;
 }
 
 async function analyzeConversation(history, userConfirmation = null) {
     const transcript = history.filter(msg => msg.role === 'user' || msg.role === 'assistant').map(msg => `${msg.role}: ${msg.content}`).join('\n');
     if (!transcript) {
-        return { sentiment: 'N/A', subject: 'Empty Conversation', resolution_status: 'N/A', tags: [], intent: 'N/A' };
+        return { sentiment: 'N/A', subject: 'Empty Conversation', relevance: 'N/A', resolution_status: 'N/A', tags: [], intent: 'N/A' };
     }
 
     try {
-        const analysisPrompt = `Analyze the following chat transcript. Return a single, valid JSON object with five keys: "sentiment" (Positive, Negative, or Neutral), "subject" (5 words or less), "intent" ("Question/Issue", "General Chat/Greeting", or "Feedback"), "resolution_status" ("Resolved", "Unresolved", or if the intent is "General Chat/Greeting", this MUST be "N/A"), and "tags" (an array of 1-3 relevant keywords). Transcript:\n${transcript}`;
+        const analysisPrompt = `
+        Analyze the following chat transcript. Your task is to classify it based on its content.
+        Return a single, valid JSON object with the following six keys:
+        1. "sentiment": "Positive", "Negative", or "Neutral".
+        2. "subject": A brief, 5-word-or-less summary of the main topic.
+        3. "intent": Classify the user's primary goal. Must be one of: "Question/Issue", "General Chat/Greeting", or "Feedback".
+        4. "relevance": Based on the assistant's capabilities shown in the transcript, classify if the user's query was relevant to the business. Must be "Relevant" or "Irrelevant".
+        5. "resolution_status": The final state of the user's query. Must be one of: "Resolved", "Unresolved", or "N/A".
+        6. "tags": An array of 1-3 relevant string keywords.
+
+        **CRITICAL RULES for resolution_status:**
+        - If the "intent" is "General Chat/Greeting", resolution_status MUST be "N/A".
+        - If the "relevance" is "Irrelevant", resolution_status MUST be "N/A".
+        - Otherwise, determine if the issue was resolved or not based on the conversation.
+
+        Transcript:
+        ${transcript}
+        `;
         
         const response = await openai.chat.completions.create({
             model: 'gpt-4o-mini',
@@ -197,14 +192,16 @@ async function analyzeConversation(history, userConfirmation = null) {
             sentiment: analysis.sentiment || 'Unknown',
             subject: analysis.subject || 'No Subject',
             intent: analysis.intent || 'Unknown',
+            relevance: analysis.relevance || 'Unknown',
             resolution_status: analysis.resolution_status || 'Unknown',
             tags: analysis.tags || []
         };
     } catch (error) {
         console.error('[AI Analysis] Failed to analyze conversation:', error);
-        return { sentiment: 'Error', subject: 'Analysis Failed', resolution_status: 'Error', tags: [], intent: 'Error' };
+        return { sentiment: 'Error', subject: 'Analysis Failed', relevance: 'Error', resolution_status: 'Error', tags: [], intent: 'Error' };
     }
 }
+
 
 function slugify(text) {
     if (!text) return '';
@@ -214,7 +211,7 @@ function slugify(text) {
 async function logConversation(db, history, interactionType, origin, startTime, preChatData, userConfirmation = null) {
     if (!db || history.length <= 1) return;
     try {
-        const { sentiment, subject, resolution_status, tags, intent } = await analyzeConversation(history, userConfirmation);
+        const { sentiment, subject, resolution_status, tags, intent, relevance } = await analyzeConversation(history, userConfirmation);
         
         let transcriptHeader = '';
         if (preChatData) {
@@ -222,7 +219,6 @@ async function logConversation(db, history, interactionType, origin, startTime, 
         }
         
         const fullTranscript = transcriptHeader + history.filter(msg => msg.role !== 'system').map(msg => `[${msg.role}] ${msg.content}`).join('\n---\n');
-        
         if (!fullTranscript.trim()) return;
         
         const date = new Date(startTime);
@@ -239,6 +235,7 @@ async function logConversation(db, history, interactionType, origin, startTime, 
             transcript: fullTranscript,
             resolution_status,
             intent,
+            relevance,
             tags
         };
 
@@ -248,7 +245,7 @@ async function logConversation(db, history, interactionType, origin, startTime, 
         }
 
         await db.collection('conversations').doc(docId).set(logData);
-        console.log(`[Firestore] Logged conversation with ID: "${docId}", Intent: ${intent}, Status: ${resolution_status}`);
+        console.log(`[Firestore] Logged conversation: "${docId}", Intent: ${intent}, Relevance: ${relevance}, Status: ${resolution_status}`);
     } catch (error) { console.error('[Firestore] Failed to log conversation:', error.message); }
 }
 
@@ -295,15 +292,12 @@ wss.on('connection', (ws, req, tenantId) => {
                 const configData = data.data?.config || {};
                 preChatData = data.data?.preChatData || null;
                 conversationHistory = [{ role: 'system', content: generateSystemPrompt(configData, data.data?.pageContext, preChatData) }];
-                
                 if (preChatData && preChatData.name) {
                     conversationHistory.push({ role: 'metadata', content: `The user's name is ${preChatData.name}.` });
                 }
-                
                 ttsVoice = configData.tts_voice || 'nova';
                 let initialMessage = data.data?.isProactive ? (configData.proactive_message || 'Hello! Have any questions?') : (configData.welcome_message || `Hi there! How can I help?`);
                 conversationHistory.push({ role: 'assistant', content: initialMessage });
-                
                 if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'AI_RESPONSE', text: initialMessage }));
                 return;
             }
@@ -358,14 +352,9 @@ wss.on('connection', (ws, req, tenantId) => {
         } catch (e) {
             if (Buffer.isBuffer(message)) {
                 currentAudioBufferSize += message.length;
-                if (currentAudioBufferSize > MAX_AUDIO_BUFFER_SIZE_MB * 1024 * 1024) {
-                    ws.terminate();
-                } else {
-                    audioBufferArray.push(message);
-                }
-            } else {
-                console.error(`[Process Tenant ${tenantId}] Received invalid message:`, message);
-            }
+                if (currentAudioBufferSize > MAX_AUDIO_BUFFER_SIZE_MB * 1024 * 1024) { ws.terminate(); }
+                else { audioBufferArray.push(message); }
+            } else { console.error(`[Process Tenant ${tenantId}] Received invalid message:`, message); }
         }
     });
     
@@ -386,41 +375,20 @@ server.on('upgrade', (req, socket, head) => {
     const origin = req.headers.origin;
     const allowedOriginsEnv = process.env.ALLOWED_ORIGINS || '';
     let isOriginAllowed = false;
-    if (allowedOriginsEnv === '*') {
-        isOriginAllowed = true;
-    } else {
-        const allowedOriginsList = allowedOriginsEnv.split(',');
-        if (allowedOriginsList.includes(origin)) {
-            isOriginAllowed = true;
-        }
-    }
-
+    if (allowedOriginsEnv === '*') { isOriginAllowed = true; }
+    else { const allowedOriginsList = allowedOriginsEnv.split(','); if (allowedOriginsList.includes(origin)) { isOriginAllowed = true; } }
     if (!isOriginAllowed) {
         console.error(`[WS Upgrade] Blocked origin: '${origin}'. It is not in the allowed list: '${allowedOriginsEnv}'`);
         socket.destroy();
         return;
     }
-    
     try {
         const requestUrl = new URL(req.url, `ws://${req.headers.host}`);
         const token = requestUrl.searchParams.get('token');
-        if (!token) {
-            console.error('[WS Upgrade] Blocked request: No token provided.');
-            socket.destroy();
-            return;
-        }
+        if (!token) { console.error('[WS Upgrade] Blocked request: No token provided.'); socket.destroy(); return; }
         jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
-            if (err || !decoded.tenantId) {
-                console.error('[WS Upgrade] Blocked request: Invalid or expired token.');
-                socket.destroy();
-                return;
-            }
-            wss.handleUpgrade(req, socket, head, (ws) => {
-                wss.emit('connection', ws, req, decoded.tenantId);
-            });
+            if (err || !decoded.tenantId) { console.error('[WS Upgrade] Blocked request: Invalid or expired token.'); socket.destroy(); return; }
+            wss.handleUpgrade(req, socket, head, (ws) => { wss.emit('connection', ws, req, decoded.tenantId); });
         });
-    } catch (error) {
-        console.error('[WS Upgrade] Error processing upgrade request:', error);
-        socket.destroy();
-    }
+    } catch (error) { console.error('[WS Upgrade] Error processing upgrade request:', error); socket.destroy(); }
 });
